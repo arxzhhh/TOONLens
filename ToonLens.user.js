@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ToonLens
 // @namespace    https://toonlens.local/
-// @version      1.3.0
+// @version      1.3.1
 // @description  Live manhwa / manga / webtoon translator for Safari. Reader mode that detects and translates text as you scroll.
 // @match        http://*/*
 // @match        https://*/*
@@ -162,6 +162,11 @@ const ST = {
   nav: {}, title: '', origin: 'page', chapterLike: false, auto: 0, dirtyTr: false, dirtyLook: false,
 };
 const ui = {};
+/* ui holds live DOM refs (ui.root, ui.keysText…) and is only valid after mountUI()/loadSettings()
+   have run. Anything that renders before boot must use this safe stand-in instead of reading ui
+   directly — otherwise a ReferenceError ("can't access dead object") silently kills the action
+   (this used to break opening the Settings sheet). */
+const uiSafe = () => (ui && ui.root ? ui : {});
 
 async function loadSettings() {
   const v = await gmGet('settings', null);
@@ -182,7 +187,7 @@ async function loadSettings() {
     }
     if (!Number.isInteger(S.keyIdx) || S.keyIdx < 0) S.keyIdx = 0;
   }
-  ui.keysText = [S.apiKey, ...S.keys].filter(Boolean).join('\n');
+  uiSafe().keysText = [S.apiKey, ...S.keys].filter(Boolean).join('\n');
 }
 const saveSettings = () => gmSet('settings', S);
 const modelName = () => (S.provider === 'local' ? String(S.model || '').trim() : S.provider === 'openrouter' ? (String(S.model || '').trim() || String(S.orModel || '').trim()) : S.model || MODEL_DEFAULT[S.provider] || '');
@@ -1229,8 +1234,33 @@ const SCHEMA = [
   ]],
 ];
 
+/* Builds the whole settings sheet. Every failure mode is contained: if anything throws while
+   rendering, the sheet still opens with an error note instead of the button silently doing
+   nothing (that was the "can't open settings" bug). */
 function openSettings() {
-  if (ui.sheet) return;
+  /* If boot hasn't finished mounting the overlay (e.g. an early click on a slow page), mount it
+     now instead of doing nothing — the old code appended to a missing ui.root and died silently. */
+  if (!ui.root) { try { mountUI(); } catch (e) { console.error('[ToonLens] mount failed:', e); } }
+  try { openSettingsInner(); } catch (e) {
+    console.error('[ToonLens] settings failed to open:', e);
+    try {
+      if (ui.sheet) { ui.sheet.remove(); ui.sheet = null; }
+      const target = ui.root || document.body || document.documentElement;
+      target.appendChild(el('div', { class: 'root' },
+        el('div', { class: 'sheet' }, el('div', { class: 'card' },
+          el('h2', { text: 'ToonLens settings' }),
+          el('div', { class: 'note', text: 'The settings panel hit an error while opening: ' + ((e && e.message) || e) + '. Reload the page and try again.' }),
+          el('div', { class: 'row gap end2' }, el('button', { class: 'btn pri', text: 'Close', onclick: ev => { const s = ev.currentTarget.closest('.sheet'); if (s) s.remove(); } }))))));
+    } catch (e2) { /* last resort: nothing more we can do */ }
+  }
+}
+
+function openSettingsInner() {
+  /* Never stack a second sheet on top of an existing one (would leave two "Done" buttons and
+     double-persist settings). Remove any stale sheet first, then build fresh. */
+  const stale = document.querySelectorAll('#toonlens-host .sheet, body > .root > .sheet');
+  for (const s of stale) s.remove();
+  ui.sheet = null;
   const vis = [], persist = () => { clearTimeout(ST.pt); ST.pt = setTimeout(saveSettings, 300); };
   let refresh = () => vis.forEach(v => v.w.classList.toggle('hide', !v.show(S)));
   const body = el('div');
@@ -1258,7 +1288,7 @@ function openSettings() {
         const cap = el('span', { text: f.l });
         let c;
         if (f.t === 'select') { c = el('select', { onchange: e => upd(e.target.value) }, ...f.o.map(o => el('option', { value: o[0], text: o[1] }))); c.value = S[f.k]; }
-        else if (f.t === 'area') c = el('textarea', { placeholder: f.ph || '', oninput: e => upd(e.target.value), value: f.k === 'keysText' ? ui.keysText : S[f.k] });
+        else if (f.t === 'area') c = el('textarea', { placeholder: f.ph || '', oninput: e => upd(e.target.value), value: f.k === 'keysText' ? uiSafe().keysText : S[f.k] });
         else if (f.t === 'range') {
           const lab = () => cap.textContent = f.l + ': ' + S[f.k] + (f.u || '');
           c = el('input', { type: 'range', min: f.min, max: f.max, step: f.step, value: S[f.k], oninput: e => { upd(+e.target.value); lab(); } }); lab();
@@ -1269,7 +1299,13 @@ function openSettings() {
         ctl[f.k] = c;
         const hintTxt = () => (typeof f.h === 'function' ? f.h(S) : f.h);
         w = el('label', { class: 'f' }, cap, c, f.h ? el('small', { text: hintTxt() }) : null);
-        if (typeof f.h === 'function') (f.h._set = s => { const n = w.querySelector('small'); if (n) n.textContent = hintTxt(); })._set(S);
+        /* NOTE: assign first, then call. The old one-liner `(f.h._set = s => {...})._set(S)`
+           returned the *outer* arrow function (which takes no args and is not _set), so opening
+           Settings threw "f.h._set._set is not a function" and the sheet never appeared. */
+        if (typeof f.h === 'function') {
+          f.h._set = () => { const n = w.querySelector('small'); if (n) n.textContent = hintTxt(); };
+          f.h._set();
+        }
       }
       if (f.show) vis.push({ w, show: f.show });
       body.append(w);
