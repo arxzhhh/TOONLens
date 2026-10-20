@@ -357,24 +357,31 @@ function sampleBg(ctx, cw, ch, y1, x1, y2, x2) {
   return { c, busy: R.length ? dev / R.length > 26 : false, spread: R.length ? sd / (R.length * 3) : 0 };
 }
 
-/* Detect whether a model box hugs the dark ink outline of the bubble instead of the text.
-   Vision models sometimes return "the speech bubble" rather than "the text inside it"; painting
-   such a box would cover the outline with a flat rectangle that screams sticker. We only accept
-   boxes whose top/bottom edges sit on the sampled fill itself — an edge covered by ink is NOT a
-   text box, so callers shrink it away from the outline and re-sample. */
+/* Detect whether a model box hugs the lettering inside the bubble instead of boxing the whole
+   bubble including its dark outline. Vision models sometimes return "the speech bubble" rather
+   than "the text inside it"; painting such a box would erase the bubble's own border and replace
+   it with a flat rectangle that screams sticker. A real glyph box has clean fill along ALL four
+   edges; an outline-inclusive box has ink at the top AND bottom (and usually left/right). So we
+   measure each side independently: a side counts as dirty when many of its pixels are far from
+   the sampled fill. Any dirty side fails the check, forcing callers to shrink toward the glyphs. */
 function edgeClean(d, bw, bh, t, c) {
   const near = (i) => Math.abs(d[i] - c[0]) <= 34 && Math.abs(d[i + 1] - c[1]) <= 34 && Math.abs(d[i + 2] - c[2]) <= 34;
-  const rows = [];
-  for (let y = 0; y < bh; y++) if (y < t || y >= bh - t) rows.push(y);
-  let ok = 0, tot = 0;
-  for (const y of rows) { const rowStart = y * bw * 4; let hits = 0, n = 0;
-    for (let x = 0; x < bw; x += 2) { const i = rowStart + x * 4; if (d[i + 3] > 200) { n++; if (near(i)) hits++; } }
-    if (n >= 4) { tot++; if (hits / n >= 0.6) ok++; } }
-  return tot >= 2 ? ok / tot >= 0.5 : true;
+  /* fraction of non-fill pixels on one edge band that makes the side count as "covered by ink" */
+  const DIRTY = 0.25;
+  const band = (ys, xs) => { let hits = 0, n = 0;
+    for (const y of ys) { const rowStart = y * bw * 4;
+      for (const x of xs) { const i = rowStart + x * 4; if (d[i + 3] > 200) { n++; if (!near(i)) hits++; } } }
+    return n >= 4 && hits / n > DIRTY; };
+  const hrows = [], vrows = [];
+  for (let y = 0; y < bh; y++) if (y < t || y >= bh - t) hrows.push(y);
+  for (let y = Math.floor(bh / 4); y < Math.ceil(bh * 3 / 4); y++) vrows.push(y);
+  const hx = []; for (let x = 0; x < bw; x += 2) hx.push(x);
+  const vx = []; for (let x = 0; x < t; x++) vx.push(x); for (let x = bw - t; x < bw; x++) vx.push(x);
+  return !(band(hrows, hx) || band(vrows, vx));
 }
 
-/* Shrink a box away from the bubble outline until its top/bottom edges sit on clean fill
-   (max ~26% per axis, then give up). Returns updated coords or null if hopeless. */
+/* Shrink a box away from the bubble outline until ALL FOUR edges sit on clean fill (max ~26% per
+   axis, then give up). Returns updated coords or null if hopeless. */
 function trimToFill(ctx, cw, ch, b) {
   let [y1, x1, y2, x2] = b;
   for (let i = 0; i < 4; i++) {
@@ -384,9 +391,16 @@ function trimToFill(ctx, cw, ch, b) {
     if (bw < 6 || bh < 6) return null;
     let d; try { d = ctx.getImageData(X1, Y1, bw, bh).data; } catch (e) { return null; }
     const t = Math.max(1, Math.round(Math.min(bw, bh) * 0.1));
-    const bg = sampleBg(ctx, cw, ch, y1, x1, y2, x2);
-    if (!bg) return null;
-    if (edgeClean(d, bw, bh, t, bg.c)) return [y1, x1, y2, x2];
+    /* Sample the FILL only from top/bottom edge bands: a glyph box has clean fill there, while an
+       outline-inclusive box's left/right bands are mostly outline ink — sampling them would drag
+       the median toward the border colour and make every edge look "clean". */
+    const R = [], Gc = [], B = [];
+    const push = (x, y) => { const j = (y * bw + x) * 4; if (d[j + 3] > 200) { R.push(d[j]); Gc.push(d[j + 1]); B.push(d[j + 2]); } };
+    for (let y = 0; y < bh; y++) if (y < t || y >= bh - t) for (let x = 0; x < bw; x += 2) push(x, y);
+    if (!R.length) return null;
+    const med = a => Uint8Array.from(a).sort()[a.length >> 1];
+    const fillC = [med(R), med(Gc), med(B)];
+    if (edgeClean(d, bw, bh, t, fillC)) return [y1, x1, y2, x2];
     const my = clamp(Math.round(t * 1.7), 1, 18), mx = clamp(Math.round(t * 1.7), 1, 18);
     if ((y2 - y1) - 2 * my < 12 || (x2 - x1) - 2 * mx < 20) return [y1, x1, y2, x2]; /* can't shrink further */
     y1 += my / ch * 1000; y2 -= my / ch * 1000; x1 += mx / cw * 1000; x2 -= mx / cw * 1000;
@@ -496,14 +510,17 @@ function normItems(list, sl, cv) {
     if (!tr) continue;
     const kind = normKind(it.kind);
     if (kind === 'sfx' && !S.sfx) continue;
-    const shH = sl.y1 - sl.y0, fy1 = (sl.y0 + y1 / 1000 * shH) / sl.H, fy2 = (sl.y0 + y2 / 1000 * shH) / sl.H;
+    const shH = sl.y1 - sl.y0;
     /* keep the paint box on the text glyphs only — if the model boxed the whole bubble, shrink
        it inside the outline so we never erase the bubble's own border */
     let bx = [y1, x1, y2, x2];
     if (ctx) { const t = trimToFill(ctx, cv.width, cv.height, bx); if (!t) continue; bx = t; }
     const bg = ctx ? sampleBg(ctx, cv.width, cv.height, bx[0], bx[1], bx[2], bx[3]) : null;
+    /* recompute page fractions from the TRIMMED box: fy1/fy2 must match bx, otherwise a shrunk
+       box still paints/overlays at the original (outline-inclusive) height and covers the border */
+    const gy1 = (sl.y0 + bx[0] / 1000 * shH) / sl.H, gy2 = (sl.y0 + bx[2] / 1000 * shH) / sl.H;
     out.push({
-      x: +(bx[1] / 1000).toFixed(4), y: +fy1.toFixed(5), w: +((bx[3] - bx[1]) / 1000).toFixed(4), h: +(fy2 - fy1).toFixed(5),
+      x: +(bx[1] / 1000).toFixed(4), y: +gy1.toFixed(5), w: +((bx[3] - bx[1]) / 1000).toFixed(4), h: +(gy2 - gy1).toFixed(5),
       sx: Math.round(bx[1] / 1000 * cv.width), sy: Math.round(bx[0] / 1000 * cv.height),
       sw: Math.max(1, Math.round((bx[3] - bx[1]) / 1000 * cv.width)), sh: Math.max(1, Math.round((bx[2] - bx[0]) / 1000 * cv.height)),
       text: String(it.text || '').trim(), tr, kind, bg: bg ? bg.c : null, busy: bg ? bg.busy : false, spread: bg ? bg.spread : 0,
@@ -1028,27 +1045,41 @@ function paintOver(cx, W, it) {
   const w = clamp(it.sw + padX * 2, 1, W - x), h = clamp(it.sh + padY * 2, 1, H - y);
   /* Feather width adapts to how noisy the surrounding fill is: a perfectly flat white bubble
      needs only a couple of px to kill the seam, but grainy/gradient-shaded art shows a flat
-     rectangle even with soft edges, so we blend over a much wider band there. */
+     rectangle even with soft edges, so we blend over a much wider band there. Scale with the
+     page resolution too — a few px means nothing on a 3000px-wide webtoon page. */
   const grain = clamp(Math.round(spread * 0.9), 0, 16);
-  const feather = clamp(Math.max(3, Math.round(Math.min(w, h) * 0.3)) + grain, 3, Math.max(4, Math.floor(Math.min(w, h) / 2.5)));
+  const res = clamp(Math.round(W / 500), 1, 4);
+  const feather = clamp(4 * res + Math.round(Math.min(w, h) * 0.08) + grain, 3, Math.max(4, Math.floor(Math.min(w, h) / 2.5)));
+  /* The blurred outer ring only feathers a band `feather` wide — everything further in must be
+     solid or ghosted glyphs show through the patch. On small boxes (narration strips, tight
+     captions) that interior would vanish, so cap the feather to keep ≥ 6px of dead-solid core
+     on every side; the box padding already gives most of the visual softness there. */
+  const f = Math.min(feather, Math.max(3, Math.floor((Math.min(w, h) - 12) / 2)));
   const mk = document.createElement('canvas');
   mk.width = w; mk.height = h;
   const m = mk.getContext('2d');
   m.fillStyle = '#fff';
   m.beginPath();
-  const r = Math.min(h / 2, Math.max(3, feather));
+  const r = Math.min(h / 2, Math.max(3, f));
   if (m.roundRect) m.roundRect(0, 0, w, h, r); else m.rect(0, 0, w, h);
   m.fill();
-  /* feathered frame: stroke the rect edge itself with a blurred, half-outside line so only the
-     outer half of the blur lands inside → alpha ramps from ~50% at the very edge to 100% one
-     feather inward. Keeps the whole interior solid while killing any visible rectangle seam. */
+  /* feathered frame: stroke a ring just OUTSIDE the rect edge with a blurred line, then punch
+     the still-solid interior back in. Only the blur's inner tail bleeds into the mask, so alpha
+     ramps from ~0 at the very edge to fully solid one feather inward — the seam disappears while
+     the whole interior stays opaque enough to actually hide the original glyphs. */
   m.globalCompositeOperation = 'destination-out';
-  m.filter = 'blur(' + feather + 'px)';
-  m.lineWidth = feather * 2;
+  m.filter = 'blur(' + f + 'px)';
+  m.lineWidth = f * 2;
   m.strokeStyle = '#fff';
-  if (m.roundRect) { m.beginPath(); m.roundRect(0, 0, w, h, r); m.stroke(); }
-  else m.strokeRect(0, 0, w, h);
+  if (m.roundRect) { m.beginPath(); m.roundRect(-f, -f, w + 2 * f, h + 2 * f, r + f); m.stroke(); }
+  else m.strokeRect(-f, -f, w + 2 * f, h + 2 * f);
   m.filter = 'none';
+  m.globalCompositeOperation = 'destination-over';
+  m.fillStyle = '#fff';
+  m.beginPath();
+  if (m.roundRect) m.roundRect(f, f, Math.max(1, w - 2 * f), Math.max(1, h - 2 * f), Math.max(0, r - f));
+  else m.rect(f, f, Math.max(1, w - 2 * f), Math.max(1, h - 2 * f));
+  m.fill();
   m.globalCompositeOperation = 'source-over';
   const pc = document.createElement('canvas');
   pc.width = w; pc.height = h;
