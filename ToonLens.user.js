@@ -873,12 +873,18 @@ async function translatePage(p) {
         cv.width = bmp.w; cv.height = bmp.h;
         const cx = cv.getContext('2d', { willReadFrequently: true });
         cx.drawImage(bmp.src, 0, 0);
-        /* per-item boxes are slice-relative; recover the full-page box for the paint mask */
-        const H = bmp.h;
+        /* Boxes come back in SLICE coordinates (sy/sh are relative to the slice canvas the
+           model saw). Slice heights vary, so converting through the item's page-fraction box
+           (y/h were already mapped to full-page fractions in normItems) is exact — do that
+           before painting. */
+        const W = bmp.w, H = bmp.h;
         for (const it of items) {
-          const b = [clamp((it.y * H - it.sy) / H * 1000, 0, 1000), it.x * 1000,
-                     clamp(((it.y + it.h) * H + (it.sh - it.sy)) / H * 1000, 0, 1000), (it.x + it.w) * 1000];
-          paintOver(cx, cv.width, Object.assign({}, it, { sy: Math.round(b[0] / 1000 * H), sh: Math.max(1, Math.round((b[2] - b[0]) / 1000 * H)) }));
+          const pg = Object.assign({}, it, {
+            sx: Math.round(it.x * W), sw: Math.max(1, Math.round(it.w * W)),
+            sy: Math.round(it.y * H), sh: Math.max(1, Math.round(it.h * H)),
+          });
+          paintOver(cx, W, pg);
+          it.sx = pg.sx; it.sw = pg.sw; it.sy = pg.sy; it.sh = pg.sh;   /* store page coords */
         }
         cleanBlob = await new Promise(res => cv.toBlob(res, 'image/jpeg', 0.9));
         if (!(cleanBlob instanceof Blob)) cleanBlob = null;
@@ -887,6 +893,9 @@ async function translatePage(p) {
            survive inside an otherwise-clean image — worse than the overlay fallback, which
            still paints an opaque cover rect per bubble. */
         else if (!items.every(it => it.kind === 'sfx' || it.bg)) cleanBlob = null;
+        /* ...and never on pages that are too small to sample reliably: slice-relative boxes
+           round to wrong pixels there, so we keep the per-bubble overlay path instead. */
+        else if (bmp.w < 200 || bmp.h < 200) cleanBlob = null;
       } catch (e) { cleanBlob = null; } /* tainted canvas or memory pressure → fall back to overlays */
     }
     p.rec = { v: 1, W: bmp.w, H: bmp.h, items, clean: cleanBlob }; p.key = key;
@@ -1738,7 +1747,7 @@ async function boot() {
 }
 
 /* test hook (never set in the browser) */
-if (globalThis.__TL_TEST__) Object.assign(globalThis.__TL_TEST__, { S, ST, ui, parseModelJSON, normItems, mergeItems, collectImages, findNav, buildSystem, buildUser, callModel, NET, apiPost, httpError, planSlices, openSettings, closeSettings, mountUI, applyLook, buildReader, buildPages, startReader, renderPage, fit, boot, TLError });
+if (globalThis.__TL_TEST__) Object.assign(globalThis.__TL_TEST__, { S, ST, ui, parseModelJSON, normItems, mergeItems, collectImages, findNav, buildSystem, buildUser, callModel, NET, apiPost, httpError, planSlices, openSettings, closeSettings, mountUI, applyLook, buildReader, buildPages, startReader, renderPage, fit, boot, TLError, sampleBg, edgeClean, trimToFill, paintOver, cleanTr, setCleanImg, dropClean });
 
 boot();
 })();
