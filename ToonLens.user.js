@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ToonLens
 // @namespace    https://toonlens.local/
-// @version      1.0.0
+// @version      1.1.0
 // @description  Live manhwa / manga / webtoon translator for Safari. Reader mode that detects and translates text as you scroll.
 // @match        http://*/*
 // @match        https://*/*
@@ -130,7 +130,7 @@ function gmRequest(opts) {
 /* ───────────────────────── settings ───────────────────────── */
 
 const DEFAULTS = {
-  v: 2, provider: 'gemini', apiKey: '', model: '', baseUrl: 'https://api.openai.com/v1', thinking: 'low',
+  v: 2, provider: 'gemini', apiKey: '', model: '', baseUrl: 'https://api.openai.com/v1', thinking: 'low', keys: [], keyIdx: 0, keysText: '',
   target: 'English', source: 'auto', style: 'natural', honorifics: true, sfx: true, glossary: '', extra: '',
   font: 'comic', fontScale: 100, pad: 6, caps: false, cover: true,
   prefetch: 2, concurrency: 1, scrollSpeed: 4, autoStart: false, pill: 'detected',
@@ -163,11 +163,28 @@ async function loadSettings() {
     /* 'gemini-2.5-flash' stopped having a free tier for many keys — fall back to the empty
        default so modelName() picks a model that is currently free. */
     if (v.model === 'gemini-2.5-flash') v.model = '';
+    /* One free AI Studio key has a small daily quota. Extra keys go in the "Backup API keys"
+       field (one per line) and are rotated automatically, which is how near-unlimited free
+       usage is achieved. Migrate anything pasted into the old single-key box. */
     Object.assign(S, v);
+    if (!Array.isArray(S.keys)) S.keys = [];
+    const allKeys = [S.apiKey, ...S.keys].map(k => String(k).trim()).filter(Boolean);
+    const uniq = [...new Set(allKeys)];
+    if (uniq.length !== allKeys.length || (S.apiKey && !S.keys.length)) {
+      S.apiKey = uniq[0] || ''; S.keys = uniq.slice(1);
+    }
+    if (!Number.isInteger(S.keyIdx) || S.keyIdx < 0) S.keyIdx = 0;
   }
+  ui.keysText = [S.apiKey, ...S.keys].filter(Boolean).join('\n');
 }
 const saveSettings = () => gmSet('settings', S);
 const modelName = () => S.model || MODEL_DEFAULT[S.provider] || '';
+
+/* All configured keys, primary first. */
+const allKeys = () => {
+  const raw = [S.apiKey, ...(Array.isArray(S.keys) ? S.keys : [])];
+  return [...new Set(raw.map(k => String(k).trim()).filter(Boolean))];
+};
 
 /* ─────────────────────── translation cache (IndexedDB) ─────────────────────── */
 
@@ -431,16 +448,24 @@ function learn(res) {
    "Test connection" button runs, so a failed test never freezes the whole reader. */
 function netErr(msg, kind, wait) { return testingNow ? new TestError(msg, kind, wait) : new TLError(msg, kind, wait); }
 
-function httpError(r) {
+/* Daily free quota exhausted — Google says "Resource has been exhausted" / "PerDay". */
+const isDailyQuota = text => {
+  const t = String(text || '');
+  return /RESOURCE_EXHAUSTED/i.test(t) || (/quota/i.test(t) && /(exhausted|PerDay|per day|daily|24 ?h)/i.test(t));
+};
+
+function httpError(r, keyLabel) {
   let msg = ''; try { const j = JSON.parse(r.text); msg = (j.error && (j.error.message || j.error)) || j.message || ''; } catch (e) { msg = String(r.text || '').slice(0, 200); }
   msg = String(msg);
-  if (r.status === 401 || r.status === 403) return netErr('API key rejected (' + r.status + '). Double-check the whole key is pasted in Settings — copy it again from aistudio.google.com/apikey. ' + (msg || ''), 'fatal');
+  const who = keyLabel ? ' (' + keyLabel + ')' : '';
+  if (r.status === 401 || r.status === 403) return netErr('API key rejected' + who + ' (' + r.status + '). Double-check the whole key is pasted in Settings — copy it again from aistudio.google.com/apikey. ' + (msg || ''), 'fatal');
   if (r.status === 429) {
     if (/limit:\s*0\b/.test(r.text || '')) return netErr('This model has no free quota on your key. Leave the Model field empty (or use gemini-2.5-flash-lite).', 'fatal');
-    if (/PerDay|per day|daily/i.test(r.text || '')) return netErr('Daily free quota used up. Try again tomorrow or switch the model to gemini-2.5-flash-lite.', 'fatal');
+    if (isDailyQuota(r.text)) return netErr('Daily free quota used up' + who + '. Add another free key in Settings → Backup API keys (one per line), or wait until tomorrow.', 'daily');
     const m = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(r.text || '') || /retry-after:\s*(\d+)/i.exec(r.headers || '');
     return netErr('Rate limited', 'rate', clamp(m ? Math.ceil(parseFloat(m[1]) * 1000) + 500 : 20000, 3000, 120000));
   }
+  if (r.status === 400 && isDailyQuota(r.text)) return netErr('Daily free quota used up' + who + '. Add another free key in Settings → Backup API keys (one per line), or wait until tomorrow.', 'daily');
   if (r.status === 400 && /api key|API_KEY/i.test(msg)) return netErr('API key invalid: ' + msg.slice(0, 120), 'fatal');
   if (r.status === 403 && /permission|disabled|not serve|region/i.test(msg)) return netErr('Google refused this request: ' + msg.slice(0, 160), 'fatal');
   if (r.status === 404) return netErr('Model "' + modelName() + '" not found. Leave the Model field empty for the default, or type an exact name like gemini-2.5-flash-lite.', 'fatal');
@@ -465,10 +490,30 @@ async function apiPost(url, headers, body) {
   throw netErr('Could not reach the AI service (' + errs.join('; ') + ')', 'retry');
 }
 
-async function callModel({ system, text, image }) {
-  if (!S.apiKey) throw netErr('Add your API key in Settings.', 'fatal');
+async function callModel(req) {
+  const keys = allKeys();
+  if (!keys.length) throw netErr('Add your API key in Settings.', 'fatal');
+  /* Try every configured key in turn (round-robin starting at the last one that worked). When a
+     free key hits its DAILY quota the next key is used automatically — this is how ToonLens keeps
+     translating past a single key's limit, the same trick OpenToon does with multiple accounts. */
+  let idx = clamp(Number.isInteger(S.keyIdx) ? S.keyIdx : 0, 0, keys.length - 1);
+  let lastErr = null;
+  for (let tried = 0; tried < keys.length; tried++) {
+    S.keyIdx = idx % keys.length;
+    try { return await callModelOnce(req, keys[S.keyIdx]); }
+    catch (e) {
+      lastErr = e;
+      if (!(e && e.kind === 'daily')) throw e;
+      idx++;
+    }
+  }
+  throw lastErr || netErr('Every API key has hit its daily quota.', 'daily');
+}
+
+async function callModelOnce({ system, text, image }, apiKey) {
   const p = S.provider, model = modelName();
   if (!model) throw netErr('Enter a model name in Settings.', 'fatal');
+  const keyLabel = 'key #' + (clamp(S.keyIdx || 0, 0, 99) + 1);
 
   if (p === 'gemini') {
     const gen = { temperature: 0.3, maxOutputTokens: 8192, responseMimeType: 'application/json' };
@@ -478,7 +523,7 @@ async function callModel({ system, text, image }) {
       systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts }], generationConfig: gen,
       safetySettings: ['HARASSMENT', 'HATE_SPEECH', 'SEXUALLY_EXPLICIT', 'DANGEROUS_CONTENT'].map(c => ({ category: 'HARM_CATEGORY_' + c, threshold: 'BLOCK_NONE' })),
     };
-    const headers = { 'content-type': 'application/json', 'x-goog-api-key': S.apiKey };
+    const headers = { 'content-type': 'application/json', 'x-goog-api-key': apiKey };
     /* Free-tier models change often; if the configured one is missing/has no quota, quietly try
        the other known free ones before giving up. */
     const chain = [model];
@@ -495,7 +540,7 @@ async function callModel({ system, text, image }) {
         ok = r; break;
       }
       const switchable = r.status === 404 || (r.status === 429 && /limit:\s*0\b/.test(r.text || ''));
-      if (!(switchable && i < chain.length - 1)) throw httpError(r);
+      if (!(switchable && i < chain.length - 1)) throw httpError(r, keyLabel);
     }
     let j; try { j = JSON.parse(ok.text); } catch (e) { throw netErr('Bad response from Gemini', 'retry'); }
     if (j.promptFeedback && j.promptFeedback.blockReason) throw netErr('Blocked by Gemini (' + j.promptFeedback.blockReason + ')', 'final');
@@ -508,10 +553,10 @@ async function callModel({ system, text, image }) {
   if (p === 'anthropic') {
     const content = []; if (image) content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } }); content.push({ type: 'text', text });
     const body = { model, max_tokens: 8192, temperature: 0.3, system, messages: [{ role: 'user', content }] };
-    const headers = { 'content-type': 'application/json', 'x-api-key': S.apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' };
+    const headers = { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' };
     let r = await apiPost('https://api.anthropic.com/v1/messages', headers, body);
     if (r.status === 400 && /temperature/i.test(r.text)) { delete body.temperature; r = await apiPost('https://api.anthropic.com/v1/messages', headers, body); }
-    if (r.status !== 200) throw httpError(r);
+    if (r.status !== 200) throw httpError(r, keyLabel);
     let j; try { j = JSON.parse(r.text); } catch (e) { throw netErr('Bad response from Claude', 'retry'); }
     const out = (j.content || []).filter(x => x.type === 'text').map(x => x.text).join('');
     if (!out) throw netErr('Claude returned no text', 'retry');
@@ -521,7 +566,7 @@ async function callModel({ system, text, image }) {
   const base = String(S.baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '');
   const content = [{ type: 'text', text }]; if (image) content.push({ type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + image } });
   const body = { model, temperature: 0.3, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: system }, { role: 'user', content }] };
-  const headers = { 'content-type': 'application/json', authorization: 'Bearer ' + S.apiKey };
+  const headers = { 'content-type': 'application/json', authorization: 'Bearer ' + apiKey };
   let r;
   for (let i = 0; i < 3; i++) {
     r = await apiPost(base + '/chat/completions', headers, body);
@@ -530,7 +575,7 @@ async function callModel({ system, text, image }) {
     for (const k of ['temperature', 'response_format']) if (body[k] !== undefined && new RegExp(k, 'i').test(r.text)) { delete body[k]; stripped = true; }
     if (!stripped) break;
   }
-  if (r.status !== 200) throw httpError(r);
+  if (r.status !== 200) throw httpError(r, keyLabel);
   let j; try { j = JSON.parse(r.text); } catch (e) { throw netErr('Bad response from provider', 'retry'); }
   const out = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
   if (!out) throw netErr('Provider returned no text', 'retry');
@@ -542,7 +587,7 @@ async function callModel({ system, text, image }) {
 async function translatePage(p) {
   const key = cacheKey(p), hit = await idb.get(key);
   if (hit && hit.v === 1) { p.rec = hit; p.key = key; renderPage(p); return; }
-  if (!S.apiKey) throw new TLError('Add your API key in Settings.', 'fatal');
+  if (!allKeys().length) throw new TLError('Add your API key in Settings.', 'fatal');
   const blob = p.blob || await fetchImageBlob(p.url, p.ref);
   const bmp = await decode(blob);
   try {
@@ -593,6 +638,13 @@ async function run(p) {
       p.status = 'error'; p.err = e.message;
       toast(e.message, true);
       if (/key|model/i.test(e.message)) openSettings();
+    }
+    else if (kind === 'daily') {
+      /* Every configured key is out of daily quota. Park this page with a clear message; other
+         pages stay actionable and everything resumes automatically when a quota resets. */
+      p.status = 'error'; p.err = e.message;
+      toast(e.message, true);
+      openSettings();
     }
     else if (kind === 'rate') {
       ST.backoff = Date.now() + (e.wait || 15000); p.status = 'idle';
@@ -845,7 +897,7 @@ async function startReader(o) {
     const hst = (await gmGet('history', [])).filter(x => x.url !== location.href);
     hst.unshift({ url: location.href, title: o.title, ts: Date.now() }); gmSet('history', hst.slice(0, 25));
   }
-  if (!S.apiKey) { toast('Add your API key to start translating.', true); openSettings(); }
+  if (!allKeys().length) { toast('Add your API key to start translating.', true); openSettings(); }
   schedule();
 }
 
@@ -926,7 +978,7 @@ async function showHome() {
   ui.home = el('div', { class: 'home' },
     el('div', { class: 'top' }, el('div', { class: 'brand', text: 'ToonLens' }), el('button', { class: 'btn', text: 'Close', onclick: hideHome })),
     el('p', { class: 'lede', text: 'Paste a chapter link. It opens like a normal page, then translates as you scroll.' }),
-    S.apiKey ? null : el('div', { class: 'note', text: 'No API key yet. On a computer, open aistudio.google.com/apikey, sign in with any Google account and press "Create API key" (it is free, no credit card). Copy the key that starts with AIza, then paste it into ToonLens Settings → API key.' }),
+    allKeys().length ? null : el('div', { class: 'note', text: 'No API key yet. On a computer, open aistudio.google.com/apikey, sign in with any Google account and press "Create API key" (it is free, no credit card). Copy the key that starts with AIza, then paste it into ToonLens Settings → API key.' }),
     el('div', { class: 'url' }, input, el('button', { class: 'btn pri', text: 'Open', onclick: go })),
     el('div', { class: 'row gap' }, el('button', { class: 'btn', text: 'Translate images from Photos', onclick: () => file.click() }), el('button', { class: 'btn', text: 'Settings', onclick: openSettings })),
     file, recent);
@@ -967,6 +1019,7 @@ const SCHEMA = [
   ['AI engine', [
     { k: 'provider', t: 'select', l: 'Provider', o: [['gemini', 'Google Gemini (recommended)'], ['anthropic', 'Anthropic Claude'], ['openai', 'OpenAI-compatible']] },
     { k: 'apiKey', t: 'password', l: 'API key', h: 'Free Google key: open aistudio.google.com/apikey on a computer, sign in with any Google account, press "Create API key", copy it (starts with AIza) and paste it here. No credit card needed. Stays on this device.' },
+    { k: 'keysText', t: 'area', l: 'Backup API keys', ph: 'AIza... (one per line)', h: 'Each free key has a small daily quota. Paste more free keys here, one per line (each comes from a different free Google account at aistudio.google.com/apikey). ToonLens automatically switches to the next key when one runs out of quota, so you can keep reading past the limit.' },
     { k: 'model', t: 'text', l: 'Model', h: 'Leave empty for the default (gemini-2.5-flash-lite, free tier). If you get quota errors, type gemini-2.0-flash.' },
     { k: 'baseUrl', t: 'text', l: 'API base URL', show: s => s.provider === 'openai' },
     { k: 'thinking', t: 'select', l: 'Gemini thinking', show: s => s.provider === 'gemini', o: [['minimal', 'Minimal (fastest)'], ['low', 'Low (balanced)'], ['medium', 'Medium'], ['high', 'High (slowest)'], ['off', 'Do not send']] },
@@ -1006,8 +1059,16 @@ function openSettings() {
     body.append(el('div', { class: 'grp', text: title }));
     for (const f of fields) {
       const upd = v => {
+        if (f.k === 'keysText') {
+          /* Primary box keeps the first key so it stays masked; the rest go to S.keys. */
+          const list = String(v).split(/[\n;,]+/).map(x => x.trim()).filter(Boolean);
+          const uniq = [...new Set(list)];
+          S.apiKey = uniq[0] || ''; S.keys = uniq.slice(1); S.keyIdx = 0;
+          persist(); refresh(); return;
+        }
         S[f.k] = v; if (RETR.has(f.k)) ST.dirtyTr = true; if (LOOK.has(f.k)) ST.dirtyLook = true;
         if (f.k === 'provider') { ctl.model.placeholder = MODEL_DEFAULT[v] || 'model name'; if (Object.values(MODEL_DEFAULT).includes(S.model)) { S.model = ''; ctl.model.value = ''; } }
+        if (f.k === 'apiKey') { S.keyIdx = 0; if (ctl.keysText) ctl.keysText.value = [v, ...S.keys].filter(Boolean).join('\n'); }
         persist(); refresh();
       };
       let w;
@@ -1017,7 +1078,7 @@ function openSettings() {
         const cap = el('span', { text: f.l });
         let c;
         if (f.t === 'select') { c = el('select', { onchange: e => upd(e.target.value) }, ...f.o.map(o => el('option', { value: o[0], text: o[1] }))); c.value = S[f.k]; }
-        else if (f.t === 'area') c = el('textarea', { placeholder: f.ph || '', oninput: e => upd(e.target.value), value: S[f.k] });
+        else if (f.t === 'area') c = el('textarea', { placeholder: f.ph || '', oninput: e => upd(e.target.value), value: f.k === 'keysText' ? ui.keysText : S[f.k] });
         else if (f.t === 'range') {
           const lab = () => cap.textContent = f.l + ': ' + S[f.k] + (f.u || '');
           c = el('input', { type: 'range', min: f.min, max: f.max, step: f.step, value: S[f.k], oninput: e => { upd(+e.target.value); lab(); } }); lab();
@@ -1041,7 +1102,9 @@ function openSettings() {
       await withTimeout(callModel({ system: 'You are a connectivity test.', text: 'Reply with the single word OK.' }), NET.ms + 5000, 'No response from the AI service after 95 seconds. Check your internet connection and try again.');
       out.textContent = 'Connected in ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s using ' + modelName() + '. The key works — open a chapter page and it will translate.';
     } catch (e) {
-      out.textContent = e.kind === 'rate'
+      out.textContent = e.kind === 'daily'
+        ? 'All configured keys have used up their free quota for today. Add more free keys in "Backup API keys" above (one per line), or wait until the quota resets (midnight Pacific time).'
+        : e.kind === 'rate'
         ? 'Google says you are over the free limit right now. Wait a minute and test again, or switch the model to gemini-2.5-flash-lite.'
         : ((e && e.message) || 'Failed') + ' [tried: ' + chainNote() + ']';
     } finally { testingNow = false; test.disabled = false; test.textContent = 'Test connection'; }
