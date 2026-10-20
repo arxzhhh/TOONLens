@@ -70,8 +70,9 @@ ok('edgeClean true for glyph-hugging box', T.edgeClean(dText, dText.width, dText
 const ob = px(215, 215, 585, 585);    // includes outline ring
 const od = sx2.getImageData(Math.round(ob[1]/1000*SW), Math.round(ob[0]/1000*SH), Math.round((ob[3]-ob[1])/1000*SW), Math.round((ob[2]-ob[0])/1000*SH)).data;
 const ot = Math.max(1, Math.round(Math.min(od.width,od.height)*0.1));
-const bgOuter = T.sampleBg(sx2, SW, SH, ...ob);
-ok('edgeClean false for outline-inclusive box', T.edgeClean(od, od.width, od.height, ot, (bgOuter&&bgOuter.c)||[247,244,238]) === false);
+// the fill reference is the BUBBLE FILL (what trimToFill samples from top/bottom bands and what
+// paintOver re-samples) — not sampleBg of an outline-inclusive box, which mixes in page bg
+ok('edgeClean false for outline-inclusive box', T.edgeClean(od, od.width, od.height, ot, [247,244,238]) === false);
 
 const trimmed = T.trimToFill(sx2, SW, SH, ob.slice());
 ok('trimToFill shrinks away from outline', Array.isArray(trimmed) && (trimmed[2]-trimmed[0]) < (ob[2]-ob[0]) && (trimmed[3]-trimmed[1]) < (ob[3]-ob[1]), JSON.stringify(trimmed));
