@@ -49,6 +49,16 @@ class TLError extends Error {
   constructor(msg, kind, wait) { super(msg); this.kind = kind || 'retry'; this.wait = wait || 0; }
 }
 
+/* Errors thrown while the "Test connection" button is running. The reader must NOT treat these
+   as fatal (they would silently block every page), so we tag them and filter them out in run(). */
+class TestError extends Error {
+  constructor(msg, kind, wait) { super(msg); this.name = 'TestError'; this.kind = kind || 'retry'; this.wait = wait || 0; }
+}
+let testingNow = false;
+/* Which model names the last test attempt actually tried — used in error messages. */
+let lastTriedChain = [];
+const chainNote = () => (S.provider === 'gemini' && lastTriedChain.length > 1 ? lastTriedChain.join(' → ') : modelName());
+
 function el(tag, a, ...kids) {
   const e = document.createElement(tag);
   for (const k in a || {}) {
@@ -126,7 +136,9 @@ const DEFAULTS = {
   prefetch: 2, concurrency: 1, scrollSpeed: 4, autoStart: false, pill: 'detected',
   imgMax: 1000, quality: 0.85,
 };
-const MODEL_DEFAULT = { gemini: 'gemini-2.5-flash', anthropic: 'claude-sonnet-5-5', openai: '' };
+const MODEL_DEFAULT = { gemini: 'gemini-2.5-flash-lite', anthropic: 'claude-sonnet-5-5', openai: '' };
+/* Models that Google offers on the free tier of AI Studio keys, in order of preference. */
+const GEMINI_FREE_MODELS = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
 const RETR = new Set(['provider', 'model', 'baseUrl', 'target', 'source', 'style', 'honorifics', 'sfx', 'glossary', 'extra']);
 const LOOK = new Set(['font', 'fontScale', 'pad', 'caps', 'cover']);
 const FONTS = {
@@ -139,7 +151,7 @@ const RTL = /arabic|hebrew|persian|farsi|urdu/i;
 
 const S = Object.assign({}, DEFAULTS);
 const ST = {
-  view: null, pages: [], running: 0, backoff: 0, fatal: null, session: 0, recent: [], learned: {},
+  view: null, pages: [], running: 0, backoff: 0, session: 0, recent: [], learned: {},
   nav: {}, title: '', origin: 'page', chapterLike: false, auto: 0, dirtyTr: false, dirtyLook: false,
 };
 const ui = {};
@@ -148,6 +160,9 @@ async function loadSettings() {
   const v = await gmGet('settings', null);
   if (v && typeof v === 'object') {
     if (v.v !== 2) { v.v = 2; v.concurrency = 1; v.prefetch = Math.min(v.prefetch || 2, 2); if (v.model === 'gemini-flash-latest') v.model = ''; }
+    /* 'gemini-2.5-flash' stopped having a free tier for many keys — fall back to the empty
+       default so modelName() picks a model that is currently free. */
+    if (v.model === 'gemini-2.5-flash') v.model = '';
     Object.assign(S, v);
   }
 }
@@ -412,20 +427,25 @@ function learn(res) {
 
 /* ───────────────────────── model providers ───────────────────────── */
 
+/* Errors are plain TLErrors while the reader works, but become TestErrors while the settings
+   "Test connection" button runs, so a failed test never freezes the whole reader. */
+function netErr(msg, kind, wait) { return testingNow ? new TestError(msg, kind, wait) : new TLError(msg, kind, wait); }
+
 function httpError(r) {
   let msg = ''; try { const j = JSON.parse(r.text); msg = (j.error && (j.error.message || j.error)) || j.message || ''; } catch (e) { msg = String(r.text || '').slice(0, 200); }
   msg = String(msg);
-  if (r.status === 401 || r.status === 403) return new TLError('API key rejected: ' + (msg || r.status), 'fatal');
+  if (r.status === 401 || r.status === 403) return netErr('API key rejected (' + r.status + '). Double-check the whole key is pasted in Settings — copy it again from aistudio.google.com/apikey. ' + (msg || ''), 'fatal');
   if (r.status === 429) {
-    if (/limit:\s*0\b/.test(r.text || '')) return new TLError('This model has no free quota on your key. Set the model to gemini-2.5-flash or gemini-2.5-flash-lite.', 'fatal');
-    if (/PerDay|per day|daily/i.test(r.text || '')) return new TLError('Daily free quota used up. Try again tomorrow or switch model.', 'fatal');
+    if (/limit:\s*0\b/.test(r.text || '')) return netErr('This model has no free quota on your key. Leave the Model field empty (or use gemini-2.5-flash-lite).', 'fatal');
+    if (/PerDay|per day|daily/i.test(r.text || '')) return netErr('Daily free quota used up. Try again tomorrow or switch the model to gemini-2.5-flash-lite.', 'fatal');
     const m = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(r.text || '') || /retry-after:\s*(\d+)/i.exec(r.headers || '');
-    return new TLError('Rate limited', 'rate', clamp(m ? Math.ceil(parseFloat(m[1]) * 1000) + 500 : 20000, 3000, 120000));
+    return netErr('Rate limited', 'rate', clamp(m ? Math.ceil(parseFloat(m[1]) * 1000) + 500 : 20000, 3000, 120000));
   }
-  if (r.status === 400 && /api key|API_KEY/i.test(msg)) return new TLError('API key invalid: ' + msg.slice(0, 120), 'fatal');
-  if (r.status === 404) return new TLError('Model "' + modelName() + '" not found. Check the model name in Settings.', 'fatal');
-  if (r.status >= 500) return new TLError('Provider error ' + r.status, 'retry');
-  return new TLError('Request failed (' + r.status + '): ' + msg.slice(0, 160), 'retry');
+  if (r.status === 400 && /api key|API_KEY/i.test(msg)) return netErr('API key invalid: ' + msg.slice(0, 120), 'fatal');
+  if (r.status === 403 && /permission|disabled|not serve|region/i.test(msg)) return netErr('Google refused this request: ' + msg.slice(0, 160), 'fatal');
+  if (r.status === 404) return netErr('Model "' + modelName() + '" not found. Leave the Model field empty for the default, or type an exact name like gemini-2.5-flash-lite.', 'fatal');
+  if (r.status >= 500) return netErr('Provider error ' + r.status, 'retry');
+  return netErr('Request failed (' + r.status + '): ' + msg.slice(0, 160), 'retry');
 }
 
 async function apiPost(url, headers, body) {
@@ -442,16 +462,15 @@ async function apiPost(url, headers, body) {
     const r = await gmRequest({ url, method: 'POST', headers, data, responseType: 'text', timeout: NET.ms });
     return { status: r.status, text: r.responseText != null ? r.responseText : (typeof r.response === 'string' ? r.response : ''), headers: r.responseHeaders || '' };
   } catch (e) { errs.push('userscript: ' + ((e && e.message) || e)); }
-  throw new TLError('Could not reach the AI service (' + errs.join('; ') + ')', 'retry');
+  throw netErr('Could not reach the AI service (' + errs.join('; ') + ')', 'retry');
 }
 
 async function callModel({ system, text, image }) {
-  if (!S.apiKey) throw new TLError('Add your API key in Settings.', 'fatal');
+  if (!S.apiKey) throw netErr('Add your API key in Settings.', 'fatal');
   const p = S.provider, model = modelName();
-  if (!model) throw new TLError('Enter a model name in Settings.', 'fatal');
+  if (!model) throw netErr('Enter a model name in Settings.', 'fatal');
 
   if (p === 'gemini') {
-    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent';
     const gen = { temperature: 0.3, maxOutputTokens: 8192, responseMimeType: 'application/json' };
     if (S.thinking && S.thinking !== 'off') gen.thinkingConfig = { thinkingLevel: S.thinking };
     const parts = []; if (image) parts.push({ inlineData: { mimeType: 'image/jpeg', data: image } }); parts.push({ text });
@@ -460,14 +479,29 @@ async function callModel({ system, text, image }) {
       safetySettings: ['HARASSMENT', 'HATE_SPEECH', 'SEXUALLY_EXPLICIT', 'DANGEROUS_CONTENT'].map(c => ({ category: 'HARM_CATEGORY_' + c, threshold: 'BLOCK_NONE' })),
     };
     const headers = { 'content-type': 'application/json', 'x-goog-api-key': S.apiKey };
-    let r = await apiPost(url, headers, body);
-    if (r.status === 400 && gen.thinkingConfig && /think/i.test(r.text)) { delete gen.thinkingConfig; r = await apiPost(url, headers, body); }
-    if (r.status !== 200) throw httpError(r);
-    let j; try { j = JSON.parse(r.text); } catch (e) { throw new TLError('Bad response from Gemini', 'retry'); }
-    if (j.promptFeedback && j.promptFeedback.blockReason) throw new TLError('Blocked by Gemini (' + j.promptFeedback.blockReason + ')', 'final');
+    /* Free-tier models change often; if the configured one is missing/has no quota, quietly try
+       the other known free ones before giving up. */
+    const chain = [model];
+    for (const m of GEMINI_FREE_MODELS) if (!chain.includes(m)) chain.push(m);
+    lastTriedChain = S.provider === 'gemini' ? chain.slice() : [];
+    let ok = null;
+    for (let i = 0; i < chain.length; i++) {
+      const m = chain[i];
+      const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(m) + ':generateContent';
+      let r = await apiPost(url, headers, body);
+      if (r.status === 400 && gen.thinkingConfig && /think/i.test(r.text)) { delete gen.thinkingConfig; r = await apiPost(url, headers, body); }
+      if (r.status === 200) {
+        if (m !== model && !S.model) { S.model = m; saveSettings(); toast('Using ' + m + ' (your default model had no free quota).', true); }
+        ok = r; break;
+      }
+      const switchable = r.status === 404 || (r.status === 429 && /limit:\s*0\b/.test(r.text || ''));
+      if (!(switchable && i < chain.length - 1)) throw httpError(r);
+    }
+    let j; try { j = JSON.parse(ok.text); } catch (e) { throw netErr('Bad response from Gemini', 'retry'); }
+    if (j.promptFeedback && j.promptFeedback.blockReason) throw netErr('Blocked by Gemini (' + j.promptFeedback.blockReason + ')', 'final');
     const c = j.candidates && j.candidates[0];
     const out = ((c && c.content && c.content.parts) || []).filter(x => !x.thought).map(x => x.text || '').join('');
-    if (!out) throw new TLError('Gemini returned no text' + (c && c.finishReason ? ' (' + c.finishReason + ')' : ''), 'retry');
+    if (!out) throw netErr('Gemini returned no text' + (c && c.finishReason ? ' (' + c.finishReason + ')' : ''), 'retry');
     return out;
   }
 
@@ -478,9 +512,9 @@ async function callModel({ system, text, image }) {
     let r = await apiPost('https://api.anthropic.com/v1/messages', headers, body);
     if (r.status === 400 && /temperature/i.test(r.text)) { delete body.temperature; r = await apiPost('https://api.anthropic.com/v1/messages', headers, body); }
     if (r.status !== 200) throw httpError(r);
-    let j; try { j = JSON.parse(r.text); } catch (e) { throw new TLError('Bad response from Claude', 'retry'); }
+    let j; try { j = JSON.parse(r.text); } catch (e) { throw netErr('Bad response from Claude', 'retry'); }
     const out = (j.content || []).filter(x => x.type === 'text').map(x => x.text).join('');
-    if (!out) throw new TLError('Claude returned no text', 'retry');
+    if (!out) throw netErr('Claude returned no text', 'retry');
     return out;
   }
 
@@ -497,9 +531,9 @@ async function callModel({ system, text, image }) {
     if (!stripped) break;
   }
   if (r.status !== 200) throw httpError(r);
-  let j; try { j = JSON.parse(r.text); } catch (e) { throw new TLError('Bad response from provider', 'retry'); }
+  let j; try { j = JSON.parse(r.text); } catch (e) { throw netErr('Bad response from provider', 'retry'); }
   const out = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
-  if (!out) throw new TLError('Provider returned no text', 'retry');
+  if (!out) throw netErr('Provider returned no text', 'retry');
   return out;
 }
 
@@ -536,7 +570,7 @@ async function translatePage(p) {
 function schedule() { if (ST.sched) return; ST.sched = setTimeout(() => { ST.sched = 0; pump(); }, 30); }
 
 function pump() {
-  if (ST.view !== 'reader' || ST.fatal) return;
+  if (ST.view !== 'reader') return;
   const now = Date.now();
   if (now < ST.backoff) { clearTimeout(ST.bt); ST.bt = setTimeout(schedule, ST.backoff - now + 50); return; }
   const mid = innerHeight / 2;
@@ -551,8 +585,15 @@ async function run(p) {
   try { await translatePage(p); p.status = 'done'; p.err = null; }
   catch (e) {
     if (sid !== ST.session) return;
+    if (e && e.name === 'TestError') return; // settings test in flight — never touch the queue state
     const kind = e.kind || 'retry';
-    if (kind === 'fatal') { ST.fatal = e.message; p.status = 'idle'; toast(e.message, true); if (/key|model/i.test(e.message)) openSettings(); }
+    if (kind === 'fatal') {
+      /* Do NOT freeze every page forever. Park this page with its error message so the user can
+         tap it to retry after fixing the key/model, and other pages stay actionable too. */
+      p.status = 'error'; p.err = e.message;
+      toast(e.message, true);
+      if (/key|model/i.test(e.message)) openSettings();
+    }
     else if (kind === 'rate') {
       ST.backoff = Date.now() + (e.wait || 15000); p.status = 'idle';
       if (++p.rl > 6) { p.status = 'error'; p.err = 'Rate limit kept blocking this page.'; } else toast('Rate limited. Pausing ' + Math.ceil((e.wait || 15000) / 1000) + 's.');
@@ -573,7 +614,7 @@ function chip(p) {
   else c.hidden = true;
 }
 
-function retry(p) { p.status = 'idle'; p.tries = 0; p.rl = 0; ST.fatal = null; chip(p); schedule(); }
+function retry(p) { p.status = 'idle'; p.tries = 0; p.rl = 0; chip(p); schedule(); }
 
 function updateProgress() {
   if (!ui.sub) return;
@@ -797,7 +838,7 @@ function buildEnd() {
 async function startReader(o) {
   takeOver(); if (ui.home) { ui.home.remove(); ui.home = null; }
   closePeek(); stopReader();
-  ST.view = 'reader'; ST.origin = o.origin; ST.nav = o.nav || {}; ST.title = o.title; ST.session++; ST.running = 0; ST.backoff = 0; ST.fatal = null;
+  ST.view = 'reader'; ST.origin = o.origin; ST.nav = o.nav || {}; ST.title = o.title; ST.session++; ST.running = 0; ST.backoff = 0;
   buildReader(); buildPages(o.pages); buildEnd(); rebuildIO(); applyLook();
   ui.title.textContent = o.title || 'Chapter'; updateProgress(); syncPill();
   if (o.origin === 'page') {
@@ -885,7 +926,7 @@ async function showHome() {
   ui.home = el('div', { class: 'home' },
     el('div', { class: 'top' }, el('div', { class: 'brand', text: 'ToonLens' }), el('button', { class: 'btn', text: 'Close', onclick: hideHome })),
     el('p', { class: 'lede', text: 'Paste a chapter link. It opens like a normal page, then translates as you scroll.' }),
-    S.apiKey ? null : el('div', { class: 'note', text: 'Add an API key to start translating. Gemini keys are free at aistudio.google.com/apikey.' }),
+    S.apiKey ? null : el('div', { class: 'note', text: 'No API key yet. On a computer, open aistudio.google.com/apikey, sign in with any Google account and press "Create API key" (it is free, no credit card). Copy the key that starts with AIza, then paste it into ToonLens Settings → API key.' }),
     el('div', { class: 'url' }, input, el('button', { class: 'btn pri', text: 'Open', onclick: go })),
     el('div', { class: 'row gap' }, el('button', { class: 'btn', text: 'Translate images from Photos', onclick: () => file.click() }), el('button', { class: 'btn', text: 'Settings', onclick: openSettings })),
     file, recent);
@@ -925,8 +966,8 @@ async function waitAndStart() {
 const SCHEMA = [
   ['AI engine', [
     { k: 'provider', t: 'select', l: 'Provider', o: [['gemini', 'Google Gemini (recommended)'], ['anthropic', 'Anthropic Claude'], ['openai', 'OpenAI-compatible']] },
-    { k: 'apiKey', t: 'password', l: 'API key', h: 'Stays on this device. It is only sent to the provider you pick.' },
-    { k: 'model', t: 'text', l: 'Model', h: 'Leave empty for the default. Gemini is the most accurate at placing text boxes.' },
+    { k: 'apiKey', t: 'password', l: 'API key', h: 'Free Google key: open aistudio.google.com/apikey on a computer, sign in with any Google account, press "Create API key", copy it (starts with AIza) and paste it here. No credit card needed. Stays on this device.' },
+    { k: 'model', t: 'text', l: 'Model', h: 'Leave empty for the default (gemini-2.5-flash-lite, free tier). If you get quota errors, type gemini-2.0-flash.' },
     { k: 'baseUrl', t: 'text', l: 'API base URL', show: s => s.provider === 'openai' },
     { k: 'thinking', t: 'select', l: 'Gemini thinking', show: s => s.provider === 'gemini', o: [['minimal', 'Minimal (fastest)'], ['low', 'Low (balanced)'], ['medium', 'Medium'], ['high', 'High (slowest)'], ['off', 'Do not send']] },
   ]],
@@ -993,13 +1034,17 @@ function openSettings() {
   }
   const out = el('div', { class: 'note hide' });
   const test = el('button', { class: 'btn', text: 'Test connection', onclick: async () => {
-    out.classList.remove('hide'); out.textContent = 'Testing...'; const t0 = Date.now();
+    if (testingNow) return;
+    testingNow = true; test.disabled = true; test.textContent = 'Testing...';
+    out.classList.remove('hide'); out.textContent = 'Contacting Google… this can take up to 90 s.'; const t0 = Date.now();
     try {
-      await withTimeout(callModel({ system: 'You are a connectivity test.', text: 'Reply with the single word OK.' }), NET.ms + 5000, 'No response from the AI service.');
-      out.textContent = 'Connected in ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s. The key and model work.';
+      await withTimeout(callModel({ system: 'You are a connectivity test.', text: 'Reply with the single word OK.' }), NET.ms + 5000, 'No response from the AI service after 95 seconds. Check your internet connection and try again.');
+      out.textContent = 'Connected in ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s using ' + modelName() + '. The key works — open a chapter page and it will translate.';
     } catch (e) {
-      out.textContent = e.kind === 'rate' ? 'Google says you are over the free limit right now. Wait a minute and test again, or switch the model to gemini-2.5-flash-lite.' : (e.message || 'Failed');
-    }
+      out.textContent = e.kind === 'rate'
+        ? 'Google says you are over the free limit right now. Wait a minute and test again, or switch the model to gemini-2.5-flash-lite.'
+        : ((e && e.message) || 'Failed') + ' [tried: ' + chainNote() + ']';
+    } finally { testingNow = false; test.disabled = false; test.textContent = 'Test connection'; }
   } });
   const clear = el('button', { class: 'btn', text: 'Clear saved translations', onclick: async () => { await idb.clear(); toast('Saved translations cleared'); } });
   const done = el('button', { class: 'btn pri', text: 'Done', onclick: closeSettings });
@@ -1012,7 +1057,7 @@ function openSettings() {
 function closeSettings() {
   if (!ui.sheet) return;
   ui.sheet.remove(); ui.sheet = null; clearTimeout(ST.pt); saveSettings();
-  ST.fatal = null; applyLook(); syncPill();
+  applyLook(); syncPill();
   if (ST.view === 'reader') {
     rebuildIO();
     if (ST.dirtyTr) { for (const p of ST.pages) { p.rec = null; p.ov.textContent = ''; p.status = 'idle'; p.tries = 0; p.rl = 0; chip(p); } }
