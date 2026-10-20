@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ToonLens
 // @namespace    https://toonlens.local/
-// @version      1.3.3
+// @version      1.4.0
 // @description  Live manhwa / manga / webtoon translator for Safari. Reader mode that detects and translates text as you scroll.
 // @match        http://*/*
 // @match        https://*/*
@@ -25,7 +25,8 @@
  *  2. ToonLens collects the chapter images and shows them in a clean scrolling reader.
  *  3. As each image nears the screen, it is sliced at blank gutters and sent to a vision model
  *     (Gemini by default) that finds every bubble, reads it and translates it with chapter context.
- *  4. The original text is covered with the bubble's own colour and the translation is typeset
+ *  4. The original text is erased by inpainting the bubble's own fill over it (edge-sampled
+ *     colour + soft feathered mask, so no rectangle ever shows) and the translation is typeset
  *     to fit. Results are cached on-device, so re-reading is instant and free.
  */
 
@@ -136,7 +137,7 @@ function gmRequest(opts) {
 const DEFAULTS = {
   v: 2, provider: 'gemini', apiKey: '', model: '', baseUrl: 'https://api.openai.com/v1', localBase: 'http://localhost:1234/v1', orModel: '', thinking: 'low', keys: [], keyIdx: 0, keysText: '',
   target: 'English', source: 'auto', style: 'natural', honorifics: true, sfx: true, glossary: '', extra: '',
-  font: 'comic', fontScale: 100, pad: 6, caps: false, cover: true,
+  font: 'comic', fontScale: 100, pad: 6, caps: false, cover: true, clean: true,
   prefetch: 2, concurrency: 1, scrollSpeed: 4, autoStart: false, pill: 'detected',
   imgMax: 1000, quality: 0.85,
 };
@@ -158,7 +159,7 @@ const OR_RETIRED_MODELS = {
 /* Models that Google offers on the free tier of AI Studio keys, in order of preference. */
 const GEMINI_FREE_MODELS = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
 const RETR = new Set(['provider', 'model', 'baseUrl', 'localBase', 'orModel', 'target', 'source', 'style', 'honorifics', 'sfx', 'glossary', 'extra']);
-const LOOK = new Set(['font', 'fontScale', 'pad', 'caps', 'cover']);
+const LOOK = new Set(['font', 'fontScale', 'pad', 'caps', 'cover', 'clean']);
 const FONTS = {
   comic: { l: 'Comic', f: '"Chalkboard SE","Marker Felt","Comic Neue","Comic Sans MS","Bradley Hand",system-ui,sans-serif', w: 700 },
   clean: { l: 'Clean', f: 'ui-rounded,"SF Pro Rounded",-apple-system,"Helvetica Neue",Arial,sans-serif', w: 650 },
@@ -239,7 +240,7 @@ const idb = (() => {
   };
 })();
 
-const cacheKey = p => 'v1|' + hsh([S.provider, modelName(), S.target, S.source, S.style, S.honorifics, S.sfx, S.glossary, S.extra].join('|')) + '|' + hsh(p.id);
+const cacheKey = p => 'v2|' + hsh([S.provider, modelName(), S.target, S.source, S.style, S.honorifics, S.sfx, S.glossary, S.extra].join('|')) + '|' + hsh(p.id);
 
 /* ───────────────────────── fetching images ───────────────────────── */
 
@@ -353,6 +354,43 @@ function sampleBg(ctx, cw, ch, y1, x1, y2, x2) {
   return { c, busy: R.length ? dev / R.length > 26 : false };
 }
 
+/* Detect whether a model box hugs the dark ink outline of the bubble instead of the text.
+   Vision models sometimes return "the speech bubble" rather than "the text inside it"; painting
+   such a box would cover the outline with a flat rectangle that screams sticker. We only accept
+   boxes whose top/bottom edges sit on the sampled fill itself — an edge covered by ink is NOT a
+   text box, so callers shrink it away from the outline and re-sample. */
+function edgeClean(d, bw, bh, t, c) {
+  const near = (i) => Math.abs(d[i] - c[0]) <= 34 && Math.abs(d[i + 1] - c[1]) <= 34 && Math.abs(d[i + 2] - c[2]) <= 34;
+  const rows = [];
+  for (let y = 0; y < bh; y++) if (y < t || y >= bh - t) rows.push(y);
+  let ok = 0, tot = 0;
+  for (const y of rows) { const rowStart = y * bw * 4; let hits = 0, n = 0;
+    for (let x = 0; x < bw; x += 2) { const i = rowStart + x * 4; if (d[i + 3] > 200) { n++; if (near(i)) hits++; } }
+    if (n >= 4) { tot++; if (hits / n >= 0.6) ok++; } }
+  return tot >= 2 ? ok / tot >= 0.5 : true;
+}
+
+/* Shrink a box away from the bubble outline until its top/bottom edges sit on clean fill
+   (max ~26% per axis, then give up). Returns updated coords or null if hopeless. */
+function trimToFill(ctx, cw, ch, b) {
+  let [y1, x1, y2, x2] = b;
+  for (let i = 0; i < 4; i++) {
+    const X1 = clamp(Math.round(x1 / 1000 * cw), 0, cw - 2), X2 = clamp(Math.round(x2 / 1000 * cw), X1 + 1, cw);
+    const Y1 = clamp(Math.round(y1 / 1000 * ch), 0, ch - 2), Y2 = clamp(Math.round(y2 / 1000 * ch), Y1 + 1, ch);
+    const bw = X2 - X1, bh = Y2 - Y1;
+    if (bw < 6 || bh < 6) return null;
+    let d; try { d = ctx.getImageData(X1, Y1, bw, bh).data; } catch (e) { return null; }
+    const t = Math.max(1, Math.round(Math.min(bw, bh) * 0.1));
+    const bg = sampleBg(ctx, cw, ch, y1, x1, y2, x2);
+    if (!bg) return null;
+    if (edgeClean(d, bw, bh, t, bg.c)) return [y1, x1, y2, x2];
+    const my = clamp(Math.round(t * 1.7), 1, 18), mx = clamp(Math.round(t * 1.7), 1, 18);
+    if ((y2 - y1) - 2 * my < 12 || (x2 - x1) - 2 * mx < 20) return [y1, x1, y2, x2]; /* can't shrink further */
+    y1 += my / ch * 1000; y2 -= my / ch * 1000; x1 += mx / cw * 1000; x2 -= mx / cw * 1000;
+  }
+  return [y1, x1, y2, x2];
+}
+
 /* ───────────────────────── prompt + parsing ───────────────────────── */
 
 function buildSystem() {
@@ -370,11 +408,12 @@ function buildSystem() {
     '{"items":[{"box_2d":[ymin,xmin,ymax,xmax],"text":"original text","translation":"' + S.target + ' text","kind":"speech|thought|narration|sfx|sign"}],"names":[{"src":"original name","tgt":"chosen rendering"}]}',
     '',
     'Rules:',
-    '- box_2d is a tight box around ALL text lines of ONE bubble, caption or sign, as [ymin, xmin, ymax, xmax] normalised to 0-1000 relative to this image. Never merge different bubbles; never split one bubble.',
+    '- box_2d is a tight box around ALL text lines of ONE bubble, caption or sign, as [ymin, xmin, ymax, xmax] normalised to 0-1000 relative to this image. It must hug the GLYPHS only: at least one body-length of clean empty padding between the box and the bubble outline / frame on every side. Never include the outline, tail, border or background art; never merge different bubbles; never split one bubble.',
     '- text: the original wording, lines joined with a space.',
     '- translation: ' + style + ' Keep each character\'s voice, relationships and tension consistent. Use the whole slice, the earlier lines and the glossary to resolve dropped subjects, speaker identity and ambiguity.',
-    '- Keep translations as short as the meaning allows: they are typeset inside the original bubble.',
-    '- Keep emphasis such as "?!" and "...", but never add extra punctuation or notes.',
+    '- The translation is typeset INSIDE the original bubble where the source text stood, so it must fit: keep it as short as the meaning allows (aim for no longer than the original). Prefer a shorter natural phrasing over shrinking the font.',
+    '- Output plain word characters only in translations: no markdown (* _ ** ~ < >), no brackets or braces around words, no quotation marks wrapping a whole line unless the original shows them, no emoji, no trailing spaces or newlines. One line per item.',
+    '- Keep emphasis such as "?!" and "...", but never add extra punctuation, notes or explanations.',
     S.honorifics
       ? '- Keep honorifics and kinship terms the original uses (-nim, -ssi, hyung, noona, oppa, sunbae, -san, -kun, -sama...).'
       : '- Localise honorifics into natural ' + S.target + ' forms of address.',
@@ -424,6 +463,20 @@ function parseModelJSON(t) {
 const KINDS = { speech: 1, thought: 1, narration: 1, sfx: 1, sign: 1 };
 const normKind = k => { k = String(k || '').toLowerCase(); return KINDS[k] ? k : (/sfx|sound|onomat/.test(k) ? 'sfx' : (/narr|caption/.test(k) ? 'narration' : 'speech')); };
 
+/* strip model artefacts so the line reads like native lettering: markdown emphasis, wrapping
+   quotes/brackets, stray emoji, non-breaking spaces, multiple newlines */
+function cleanTr(s) {
+  s = String(s || '').replace(/\r/g, '');
+  s = s.replace(/[*_~]{1,3}(?=\S)|(?<=\S)[*_~]{1,3}/g, '');            /* markdown emphasis */
+  s = s.replace(/`{1,3}/g, '').replace(/<\/?(?:b|i|em|strong|u)>/gi, '');
+  s = s.replace(/[\u00a0\u2007\u202f]/g, ' ').replace(/\s*\n+\s*/g, ' ');
+  s = s.replace(/\p{Extended_Pictographic}+/gu, '');                     /* emoji */
+  s = s.replace(/\s{2,}/g, ' ').trim();
+  const pair = [['"', '"'], ['“', '”'], ['「', '」'], ['『', '』'], ['‘', '’'], ['(', ')'], ['[', ']'], ['<', '>']];
+  for (let i = 0; i < 3 && s.length > 3; i++) for (const [o, c] of pair) if (s.startsWith(o) && s.endsWith(c)) s = s.slice(1, -1).trim();
+  return s.replace(/\s{2,}/g, ' ').trim();
+}
+
 /* convert model boxes (slice-relative, 0-1000) to fractions of the whole image */
 function normItems(list, sl, cv) {
   const out = [], ctx = cv ? cv.getContext('2d', { willReadFrequently: true }) : null;
@@ -436,14 +489,20 @@ function normItems(list, sl, cv) {
     if (x1 > x2) [x1, x2] = [x2, x1];
     [y1, x1, y2, x2] = [y1, x1, y2, x2].map(v => clamp(v, 0, 1000));
     if (x2 - x1 < 4 || y2 - y1 < 4) continue;
-    const tr = String(it.translation != null ? it.translation : (it.tr || '')).trim();
+    const tr = cleanTr(String(it.translation != null ? it.translation : (it.tr || '')).trim());
     if (!tr) continue;
     const kind = normKind(it.kind);
     if (kind === 'sfx' && !S.sfx) continue;
-    const sh = sl.y1 - sl.y0, fy1 = (sl.y0 + y1 / 1000 * sh) / sl.H, fy2 = (sl.y0 + y2 / 1000 * sh) / sl.H;
-    const bg = ctx ? sampleBg(ctx, cv.width, cv.height, y1, x1, y2, x2) : null;
+    const shH = sl.y1 - sl.y0, fy1 = (sl.y0 + y1 / 1000 * shH) / sl.H, fy2 = (sl.y0 + y2 / 1000 * shH) / sl.H;
+    /* keep the paint box on the text glyphs only — if the model boxed the whole bubble, shrink
+       it inside the outline so we never erase the bubble's own border */
+    let bx = [y1, x1, y2, x2];
+    if (ctx) { const t = trimToFill(ctx, cv.width, cv.height, bx); if (!t) continue; bx = t; }
+    const bg = ctx ? sampleBg(ctx, cv.width, cv.height, bx[0], bx[1], bx[2], bx[3]) : null;
     out.push({
-      x: +(x1 / 1000).toFixed(4), y: +fy1.toFixed(5), w: +((x2 - x1) / 1000).toFixed(4), h: +(fy2 - fy1).toFixed(5),
+      x: +(bx[1] / 1000).toFixed(4), y: +fy1.toFixed(5), w: +((bx[3] - bx[1]) / 1000).toFixed(4), h: +(fy2 - fy1).toFixed(5),
+      sx: Math.round(bx[1] / 1000 * cv.width), sy: Math.round(bx[0] / 1000 * cv.height),
+      sw: Math.max(1, Math.round((bx[3] - bx[1]) / 1000 * cv.width)), sh: Math.max(1, Math.round((bx[2] - bx[0]) / 1000 * cv.height)),
       text: String(it.text || '').trim(), tr, kind, bg: bg ? bg.c : null, busy: bg ? bg.busy : false,
       edge: (sl.cutTop && y1 < 15) || (sl.cutBot && y2 > 985),
     });
@@ -800,7 +859,27 @@ async function translatePage(p) {
       all.push(...normItems(res.items, sl, cv));
     }
     const items = mergeItems(all);
-    p.rec = { v: 1, W: bmp.w, H: bmp.h, items }; p.key = key;
+    /* erase the original lettering by inpainting each bubble's own fill over it, feathered at
+       the edges so no rectangle is ever visible — the page then reads as if it were drawn in
+       the target language. Done once per page; the result is cached like everything else. */
+    let cleanUrl = '';
+    if (S.clean && S.cover) {
+      try {
+        const cv = document.createElement('canvas');
+        cv.width = bmp.w; cv.height = bmp.h;
+        const cx = cv.getContext('2d', { willReadFrequently: true });
+        cx.drawImage(bmp.src, 0, 0);
+        /* per-item boxes are slice-relative; recover the full-page box for the paint mask */
+        const H = bmp.h;
+        for (const it of items) {
+          const b = [clamp((it.y * H - it.sy) / H * 1000, 0, 1000), it.x * 1000,
+                     clamp(((it.y + it.h) * H + (it.sh - it.sy)) / H * 1000, 0, 1000), (it.x + it.w) * 1000];
+          paintOver(cx, cv.width, Object.assign({}, it, { sy: Math.round(b[0] / 1000 * H), sh: Math.max(1, Math.round((b[2] - b[0]) / 1000 * H)) }));
+        }
+        cleanUrl = cv.toDataURL('image/jpeg', 0.9);
+      } catch (e) { cleanUrl = ''; } /* tainted canvas or memory pressure → fall back to overlays */
+    }
+    p.rec = { v: 1, W: bmp.w, H: bmp.h, items, clean: cleanUrl }; p.key = key;
     idb.set(key, p.rec);
     for (const it of items.slice(-6)) ST.recent.push(it.tr);
     ST.recent = ST.recent.slice(-14);
@@ -874,6 +953,70 @@ function updateProgress() {
 
 /* ───────────────────────── bubble rendering ───────────────────────── */
 
+/* Swap the page's visible image for the inpainted (original-text-erased) version. The original
+   download stays in p.imgSrc so toggling "Inpaint" off restores it untouched. */
+function setCleanImg(p) {
+  if (!p.img || !p.el.isConnected) return;
+  const use = S.clean && S.cover && p.rec && p.rec.clean;
+  if (use) { if (p.img.src !== p.rec.clean) p.img.src = p.rec.clean; }
+  else if (p.imgSrc && p.img.src !== p.imgSrc) p.img.src = p.imgSrc;
+}
+
+/* Paint the sampled bubble fill over the original glyphs on a full-page canvas, with a soft
+   feathered mask so the patch blends into the art instead of looking like a pasted rectangle.
+   `it` carries a box in FULL-PAGE pixel coordinates (sy/sh) plus x/w as page fractions. */
+function paintOver(cx, W, it) {
+  if (it.kind === 'sfx') return;                       /* SFX overlays never erase the art */
+  const H = cx.canvas.height;
+  /* re-sample the bubble fill from the FULL-PAGE canvas: it.bg was sampled on a resized slice,
+     and flat-filled patches only look native when they match the exact pixels underneath */
+  let c = it.bg;
+  try {
+    const sx = clamp(it.sx, 0, W - 2), sy = clamp(it.sy, 0, H - 2);
+    const sw = clamp(it.sw, 1, W - sx), sh = clamp(it.sh, 1, H - sy);
+    const d = cx.getImageData(sx, sy, sw, sh).data;
+    const t = Math.max(1, Math.round(Math.min(sw, sh) * 0.1)), R = [], Gc = [], B = [];
+    const push = (x, y) => { const i = (y * sw + x) * 4; if (d[i + 3] > 200) { R.push(d[i]); Gc.push(d[i + 1]); B.push(d[i + 2]); } };
+    for (let y = 0; y < sh; y++) { if (y < t || y >= sh - t) { for (let x = 0; x < sw; x += 2) push(x, y); } else { for (let x = 0; x < t; x++) push(x, y); for (let x = sw - t; x < sw; x++) push(x, y); } }
+    if (R.length >= 8) { const med = a => Uint8Array.from(a).sort()[a.length >> 1]; c = [med(R), med(Gc), med(B)]; }
+  } catch (e) { /* tainted canvas — fall back to the slice sample below */ }
+  if (!c) return;
+  /* pad in the same units the overlay cover uses (page fractions), so the painted patch always
+     extends at least as far as the DOM rectangle and no leftover glyph peeks out beside it */
+  const padX = Math.max(2, Math.round(W * it.w * (S.pad / 100 + 0.02)));
+  const padY = Math.max(2, Math.round(H * it.h * (S.pad / 100 + 0.02)));
+  const x = clamp(it.sx - padX, 0, W - 1), y = clamp(it.sy - padY, 0, H - 1);
+  const w = clamp(it.sw + padX * 2, 1, W - x), h = clamp(it.sh + padY * 2, 1, H - y);
+  const feather = Math.max(3, Math.min(14, Math.round(Math.min(w, h) * 0.3)));
+  const mk = document.createElement('canvas');
+  mk.width = w; mk.height = h;
+  const m = mk.getContext('2d');
+  m.fillStyle = '#fff';
+  m.beginPath();
+  const r = Math.min(h / 2, Math.max(3, feather));
+  if (m.roundRect) m.roundRect(0, 0, w, h, r); else m.rect(0, 0, w, h);
+  m.fill();
+  /* feathered frame: stroke the rect edge itself with a blurred, half-outside line so only the
+     outer half of the blur lands inside → alpha ramps from ~50% at the very edge to 100% one
+     feather inward. Keeps the whole interior solid while killing any visible rectangle seam. */
+  m.globalCompositeOperation = 'destination-out';
+  m.filter = 'blur(' + feather + 'px)';
+  m.lineWidth = feather * 2;
+  m.strokeStyle = '#fff';
+  if (m.roundRect) { m.beginPath(); m.roundRect(0, 0, w, h, r); m.stroke(); }
+  else m.strokeRect(0, 0, w, h);
+  m.filter = 'none';
+  m.globalCompositeOperation = 'source-over';
+  const pc = document.createElement('canvas');
+  pc.width = w; pc.height = h;
+  const pctx = pc.getContext('2d');
+  pctx.fillStyle = 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')';
+  pctx.fillRect(0, 0, w, h);
+  pctx.globalCompositeOperation = 'destination-in';
+  pctx.drawImage(mk, 0, 0);
+  cx.drawImage(pc, x, y);
+}
+
 function fit(text, wN, hN, maxPx, rtl) {
   if (!ui.meas) { ui.meas = el('div', { class: 'meas' }); ui.root.appendChild(ui.meas); }
   const m = ui.meas;
@@ -888,6 +1031,7 @@ function fit(text, wN, hN, maxPx, rtl) {
 
 function renderPage(p) {
   const rec = p.rec; if (!rec || !p.ov || !p.el.isConnected) return;
+  setCleanImg(p);
   p.ov.textContent = '';
   const rtl = RTL.test(S.target), frag = document.createDocumentFragment();
   for (const it of rec.items) frag.appendChild(bubble(p, it, rec, rtl));
@@ -1070,6 +1214,7 @@ function buildPages(list) {
       try { p.img.src = URL.createObjectURL(await fetchImageBlob(p.url, p.ref)); } catch (e) { p.el.classList.add('broken'); }
     });
     p.img.src = it.url;
+    p.imgSrc = it.url;                                  /* remembered so inpaint can be toggled back */
     p.ov = el('div', { class: 'ov' });
     p.st = el('button', { class: 'st', hidden: true }); p.st._p = p;
     p.el.append(p.img, p.ov, p.st); p.el._p = p;
@@ -1132,10 +1277,25 @@ function toggleAuto(on) {
   ST.auto = requestAnimationFrame(tick);
 }
 
+/* ───────────── show original / inpaint toggle ───────────── */
+
+function setOrig(on) {
+  if (!ui.reader) return;
+  ui.reader.classList.toggle('orig', on);
+  for (const p of ST.pages) {
+    if (!p.img || !p.el.isConnected) continue;
+    const use = !on && S.clean && S.cover && p.rec && p.rec.clean;
+    if (use) p.img.src = p.rec.clean;
+    else if (p.imgSrc && p.img.src !== p.imgSrc) p.img.src = p.imgSrc;
+  }
+}
+
 function applyLook() {
   const f = FONTS[S.font] || FONTS.comic;
   ui.root.style.setProperty('--font', f.f); ui.root.style.setProperty('--fw', f.w);
   if (ui.reader) ui.reader.classList.toggle('caps', !!S.caps);
+  /* keep the visible pages consistent with the inpaint/erase settings without a re-run */
+  if (ST.view === 'reader') setOrig(ui.reader && ui.reader.classList.contains('orig'));
 }
 
 /* ───────────────────────── entry points ───────────────────────── */
