@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ToonLens
 // @namespace    https://toonlens.local/
-// @version      1.3.2
+// @version      1.3.3
 // @description  Live manhwa / manga / webtoon translator for Safari. Reader mode that detects and translates text as you scroll.
 // @match        http://*/*
 // @match        https://*/*
@@ -356,7 +356,7 @@ function sampleBg(ctx, cw, ch, y1, x1, y2, x2) {
 /* ───────────────────────── prompt + parsing ───────────────────────── */
 
 function buildSystem() {
-  const src = S.source === 'auto' ? 'Korean, Japanese, Chinese or another language (detect it)' : S.source;
+  const src = S.source === 'auto' ? 'Korean, Japanese, Chinese, Spanish or another language (detect it)' : S.source;
   const style = {
     natural: 'Natural, idiomatic, the way an official localisation would read. Preserve tone, humour, slang and register.',
     literal: 'Faithful and close to the original wording, while still reading as correct ' + S.target + '.',
@@ -1227,7 +1227,7 @@ const SCHEMA = [
   ]],
   ['Translation', [
     { k: 'target', t: 'text', l: 'Translate into', list: true },
-    { k: 'source', t: 'select', l: 'Original language', o: [['auto', 'Detect automatically'], ['Korean', 'Korean'], ['Japanese', 'Japanese'], ['Chinese', 'Chinese'], ['English', 'English']] },
+    { k: 'source', t: 'select', l: 'Original language', o: [['auto', 'Detect automatically'], ['Korean', 'Korean'], ['Japanese', 'Japanese'], ['Chinese', 'Chinese'], ['English', 'English'], ['Spanish', 'Spanish']] },
     { k: 'style', t: 'select', l: 'Style', o: [['natural', 'Natural'], ['literal', 'Faithful'], ['casual', 'Casual']] },
     { k: 'honorifics', t: 'check', l: 'Keep honorifics (-nim, hyung, senpai)' },
     { k: 'sfx', t: 'check', l: 'Translate sound effects' },
