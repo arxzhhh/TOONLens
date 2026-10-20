@@ -137,7 +137,7 @@ function gmRequest(opts) {
 const DEFAULTS = {
   v: 2, provider: 'gemini', apiKey: '', model: '', baseUrl: 'https://api.openai.com/v1', localBase: 'http://localhost:1234/v1', orModel: '', thinking: 'low', keys: [], keyIdx: 0, keysText: '',
   target: 'English', source: 'auto', style: 'natural', honorifics: true, sfx: true, glossary: '', extra: '',
-  font: 'comic', fontScale: 100, pad: 6, caps: false, cover: true, clean: true,
+  font: 'comic', fontScale: 100, pad: 6, caps: false, cover: true, clean: true, blend: true,
   prefetch: 2, concurrency: 1, scrollSpeed: 4, autoStart: false, pill: 'detected',
   imgMax: 1000, quality: 0.85,
 };
@@ -159,7 +159,7 @@ const OR_RETIRED_MODELS = {
 /* Models that Google offers on the free tier of AI Studio keys, in order of preference. */
 const GEMINI_FREE_MODELS = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
 const RETR = new Set(['provider', 'model', 'baseUrl', 'localBase', 'orModel', 'target', 'source', 'style', 'honorifics', 'sfx', 'glossary', 'extra']);
-const LOOK = new Set(['font', 'fontScale', 'pad', 'caps', 'cover', 'clean']);
+const LOOK = new Set(['font', 'fontScale', 'pad', 'caps', 'cover', 'clean', 'blend']);
 const FONTS = {
   comic: { l: 'Comic', f: '"Chalkboard SE","Marker Felt","Comic Neue","Comic Sans MS","Bradley Hand",system-ui,sans-serif', w: 700 },
   clean: { l: 'Clean', f: 'ui-rounded,"SF Pro Rounded",-apple-system,"Helvetica Neue",Arial,sans-serif', w: 650 },
@@ -351,7 +351,10 @@ function sampleBg(ctx, cw, ch, y1, x1, y2, x2) {
   const med = a => Uint8Array.from(a).sort()[a.length >> 1];
   const c = [med(R), med(Gc), med(B)], lm = c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114;
   let dev = 0; for (let i = 0; i < R.length; i++) dev += Math.abs(R[i] * 0.299 + Gc[i] * 0.587 + B[i] * 0.114 - lm);
-  return { c, busy: R.length ? dev / R.length > 26 : false };
+  /* spread of the raw channels around the median → how noisy the fill is (grain, gradients,
+     colouring flat-shading). Used to pick a feather wide enough to hide any seam. */
+  let sd = 0; for (let i = 0; i < R.length; i++) sd += Math.abs(R[i] - c[0]) + Math.abs(Gc[i] - c[1]) + Math.abs(B[i] - c[2]);
+  return { c, busy: R.length ? dev / R.length > 26 : false, spread: R.length ? sd / (R.length * 3) : 0 };
 }
 
 /* Detect whether a model box hugs the dark ink outline of the bubble instead of the text.
@@ -409,7 +412,7 @@ function buildSystem() {
     '',
     'Rules:',
     '- box_2d is a tight box around ALL text lines of ONE bubble, caption or sign, as [ymin, xmin, ymax, xmax] normalised to 0-1000 relative to this image. It must hug the GLYPHS only: at least one body-length of clean empty padding between the box and the bubble outline / frame on every side. Never include the outline, tail, border or background art; never merge different bubbles; never split one bubble.',
-    '- text: the original wording, lines joined with a space.',
+    '- text: copy the original wording EXACTLY, character for character (this is verified against the art), lines joined with a single space. Use "..." where the art shows an ellipsis; never use asterisks.',
     '- translation: ' + style + ' Keep each character\'s voice, relationships and tension consistent. Use the whole slice, the earlier lines and the glossary to resolve dropped subjects, speaker identity and ambiguity.',
     '- The translation is typeset INSIDE the original bubble where the source text stood, so it must fit: keep it as short as the meaning allows (aim for no longer than the original). Prefer a shorter natural phrasing over shrinking the font.',
     '- Output plain word characters only in translations: no markdown (* _ ** ~ < >), no brackets or braces around words, no quotation marks wrapping a whole line unless the original shows them, no emoji, no trailing spaces or newlines. One line per item.',
@@ -503,7 +506,7 @@ function normItems(list, sl, cv) {
       x: +(bx[1] / 1000).toFixed(4), y: +fy1.toFixed(5), w: +((bx[3] - bx[1]) / 1000).toFixed(4), h: +(fy2 - fy1).toFixed(5),
       sx: Math.round(bx[1] / 1000 * cv.width), sy: Math.round(bx[0] / 1000 * cv.height),
       sw: Math.max(1, Math.round((bx[3] - bx[1]) / 1000 * cv.width)), sh: Math.max(1, Math.round((bx[2] - bx[0]) / 1000 * cv.height)),
-      text: String(it.text || '').trim(), tr, kind, bg: bg ? bg.c : null, busy: bg ? bg.busy : false,
+      text: String(it.text || '').trim(), tr, kind, bg: bg ? bg.c : null, busy: bg ? bg.busy : false, spread: bg ? bg.spread : 0,
       edge: (sl.cutTop && y1 < 15) || (sl.cutBot && y2 > 985),
     });
   }
@@ -859,10 +862,11 @@ async function translatePage(p) {
       all.push(...normItems(res.items, sl, cv));
     }
     const items = mergeItems(all);
-    /* erase the original lettering by inpainting each bubble's own fill over it, feathered at
+    /* Erase the original lettering by inpainting each bubble's own fill over it, feathered at
        the edges so no rectangle is ever visible — the page then reads as if it were drawn in
-       the target language. Done once per page; the result is cached like everything else. */
-    let cleanUrl = '';
+       the target language. The clean image is stored as a BLOB (not a data-URL string: full-page
+       JPEG data-URLs bloat IndexedDB and can hit quota on long chapters) and cached with it. */
+    let cleanBlob = null;
     if (S.clean && S.cover) {
       try {
         const cv = document.createElement('canvas');
@@ -876,10 +880,16 @@ async function translatePage(p) {
                      clamp(((it.y + it.h) * H + (it.sh - it.sy)) / H * 1000, 0, 1000), (it.x + it.w) * 1000];
           paintOver(cx, cv.width, Object.assign({}, it, { sy: Math.round(b[0] / 1000 * H), sh: Math.max(1, Math.round((b[2] - b[0]) / 1000 * H)) }));
         }
-        cleanUrl = cv.toDataURL('image/jpeg', 0.9);
-      } catch (e) { cleanUrl = ''; } /* tainted canvas or memory pressure → fall back to overlays */
+        cleanBlob = await new Promise(res => cv.toBlob(res, 'image/jpeg', 0.9));
+        if (!(cleanBlob instanceof Blob)) cleanBlob = null;
+        /* Only swap in the inpainted page when every text region was actually covered: if any
+           item lacks a sampled fill (tainted canvas, degenerate box) its original glyphs would
+           survive inside an otherwise-clean image — worse than the overlay fallback, which
+           still paints an opaque cover rect per bubble. */
+        else if (!items.every(it => it.kind === 'sfx' || it.bg)) cleanBlob = null;
+      } catch (e) { cleanBlob = null; } /* tainted canvas or memory pressure → fall back to overlays */
     }
-    p.rec = { v: 1, W: bmp.w, H: bmp.h, items, clean: cleanUrl }; p.key = key;
+    p.rec = { v: 1, W: bmp.w, H: bmp.h, items, clean: cleanBlob }; p.key = key;
     idb.set(key, p.rec);
     for (const it of items.slice(-6)) ST.recent.push(it.tr);
     ST.recent = ST.recent.slice(-14);
@@ -904,6 +914,7 @@ function pump() {
 async function run(p) {
   const sid = ST.session;
   p.status = 'run'; ST.running++; chip(p);
+  dropClean(p); /* never show a stale inpaint while this page re-runs */
   try { await translatePage(p); p.status = 'done'; p.err = null; }
   catch (e) {
     if (sid !== ST.session) return;
@@ -954,12 +965,26 @@ function updateProgress() {
 /* ───────────────────────── bubble rendering ───────────────────────── */
 
 /* Swap the page's visible image for the inpainted (original-text-erased) version. The original
-   download stays in p.imgSrc so toggling "Inpaint" off restores it untouched. */
+   download stays in p.imgSrc so toggling "Inpaint" off restores it untouched. The clean image is
+   a Blob (small in IndexedDB); we show it through an object URL and revoke old ones so Safari
+   doesn't accumulate them across a long chapter. */
 function setCleanImg(p) {
   if (!p.img || !p.el.isConnected) return;
-  const use = S.clean && S.cover && p.rec && p.rec.clean;
-  if (use) { if (p.img.src !== p.rec.clean) p.img.src = p.rec.clean; }
-  else if (p.imgSrc && p.img.src !== p.imgSrc) p.img.src = p.imgSrc;
+  const use = S.clean && S.cover && p.rec && p.rec.clean instanceof Blob;
+  if (use) {
+    if (!p.cleanUrl) { try { p.cleanUrl = URL.createObjectURL(p.rec.clean); } catch (e) { p.cleanUrl = ''; } }
+    if (p.cleanUrl && p.img.src !== p.cleanUrl) p.img.src = p.cleanUrl;
+  } else if (p.cleanUrl) {
+    if (p.img.src === p.cleanUrl && p.imgSrc) p.img.src = p.imgSrc;
+    URL.revokeObjectURL(p.cleanUrl); p.cleanUrl = '';
+  } else if (p.imgSrc && p.img.src !== p.imgSrc) p.img.src = p.imgSrc;
+}
+
+/* Drop any cached clean render of a page — called before re-running translatePage so a stale
+   inpaint never flashes while the new one is produced. */
+function dropClean(p) {
+  if (p.cleanUrl) { URL.revokeObjectURL(p.cleanUrl); p.cleanUrl = ''; }
+  if (p.rec) p.rec.clean = null;
 }
 
 /* Paint the sampled bubble fill over the original glyphs on a full-page canvas, with a soft
@@ -970,7 +995,7 @@ function paintOver(cx, W, it) {
   const H = cx.canvas.height;
   /* re-sample the bubble fill from the FULL-PAGE canvas: it.bg was sampled on a resized slice,
      and flat-filled patches only look native when they match the exact pixels underneath */
-  let c = it.bg;
+  let c = it.bg, spread = it.spread || 0;
   try {
     const sx = clamp(it.sx, 0, W - 2), sy = clamp(it.sy, 0, H - 2);
     const sw = clamp(it.sw, 1, W - sx), sh = clamp(it.sh, 1, H - sy);
@@ -978,7 +1003,12 @@ function paintOver(cx, W, it) {
     const t = Math.max(1, Math.round(Math.min(sw, sh) * 0.1)), R = [], Gc = [], B = [];
     const push = (x, y) => { const i = (y * sw + x) * 4; if (d[i + 3] > 200) { R.push(d[i]); Gc.push(d[i + 1]); B.push(d[i + 2]); } };
     for (let y = 0; y < sh; y++) { if (y < t || y >= sh - t) { for (let x = 0; x < sw; x += 2) push(x, y); } else { for (let x = 0; x < t; x++) push(x, y); for (let x = sw - t; x < sw; x++) push(x, y); } }
-    if (R.length >= 8) { const med = a => Uint8Array.from(a).sort()[a.length >> 1]; c = [med(R), med(Gc), med(B)]; }
+    if (R.length >= 8) {
+      const med = a => Uint8Array.from(a).sort()[a.length >> 1];
+      c = [med(R), med(Gc), med(B)];
+      let sd = 0; for (let i = 0; i < R.length; i++) sd += Math.abs(R[i] - c[0]) + Math.abs(Gc[i] - c[1]) + Math.abs(B[i] - c[2]);
+      spread = sd / (R.length * 3);
+    }
   } catch (e) { /* tainted canvas — fall back to the slice sample below */ }
   if (!c) return;
   /* pad in the same units the overlay cover uses (page fractions), so the painted patch always
@@ -987,7 +1017,11 @@ function paintOver(cx, W, it) {
   const padY = Math.max(2, Math.round(H * it.h * (S.pad / 100 + 0.02)));
   const x = clamp(it.sx - padX, 0, W - 1), y = clamp(it.sy - padY, 0, H - 1);
   const w = clamp(it.sw + padX * 2, 1, W - x), h = clamp(it.sh + padY * 2, 1, H - y);
-  const feather = Math.max(3, Math.min(14, Math.round(Math.min(w, h) * 0.3)));
+  /* Feather width adapts to how noisy the surrounding fill is: a perfectly flat white bubble
+     needs only a couple of px to kill the seam, but grainy/gradient-shaded art shows a flat
+     rectangle even with soft edges, so we blend over a much wider band there. */
+  const grain = clamp(Math.round(spread * 0.9), 0, 16);
+  const feather = clamp(Math.max(3, Math.round(Math.min(w, h) * 0.3)) + grain, 3, Math.max(4, Math.floor(Math.min(w, h) / 2.5)));
   const mk = document.createElement('canvas');
   mk.width = w; mk.height = h;
   const m = mk.getContext('2d');
@@ -1012,6 +1046,21 @@ function paintOver(cx, W, it) {
   const pctx = pc.getContext('2d');
   pctx.fillStyle = 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')';
   pctx.fillRect(0, 0, w, h);
+  /* Match the texture of the art around the bubble: a dead-flat fill under grainy or
+     gradient-shaded lettering reads as a pasted sticker. Sprinkle low-amplitude noise into the
+     patch (amplitude derived from the measured spread) so the inpainted area has the same
+     micro-contrast as its surroundings. */
+  if (grain >= 2) {
+    try {
+      const pd = pctx.getImageData(0, 0, w, h), q = pd.data, amp = Math.min(10, Math.max(2, Math.round(grain * 0.7)));
+      for (let i = 0; i < q.length; i += 4) {
+        if (q[i + 3] < 8) continue;
+        const n = Math.round((Math.random() * 2 - 1) * amp);
+        q[i] = clamp(q[i] + n, 0, 255); q[i + 1] = clamp(q[i + 1] + n, 0, 255); q[i + 2] = clamp(q[i + 2] + n, 0, 255);
+      }
+      pctx.putImageData(pd, 0, 0);
+    } catch (e) { /* getImageData unavailable on this context — flat fill still works */ }
+  }
   pctx.globalCompositeOperation = 'destination-in';
   pctx.drawImage(mk, 0, 0);
   cx.drawImage(pc, x, y);
@@ -1056,7 +1105,20 @@ function bubble(p, it, rec, rtl) {
     tx.style.fontSize = (size / W * 100).toFixed(3) + 'cqw';
     if (S.cover && it.bg) {
       const c = it.bg, lum = c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114, rgb = 'rgb(' + c.join(',') + ')';
-      b.style.background = rgb; b.style.boxShadow = '0 0 0.5cqw 0.2cqw ' + rgb;
+      b.style.background = rgb;
+      /* Inpaint mode already erased the original text into the page image, so the DOM box is
+         only a safety cover — feather its edges and drop the halo glow, otherwise the box's own
+         rectangle/blur outline sits over a perfectly clean bubble and "looks off". When the
+         inpainted image is unavailable (fallback overlays), keep the solid cover + glow. */
+      if (S.blend && S.clean && rec.clean) {
+        const r = Math.min(6, Math.max(2, w * W * 0.012));
+        b.style.borderRadius = r.toFixed(1) + 'px';
+        b.style.boxShadow = 'none';
+        b.style.webkitMaskImage = 'radial-gradient(closest-side, #000 calc(100% - ' + Math.ceil(r + 3) + 'px), transparent 100%)';
+        b.style.maskImage = 'radial-gradient(closest-side, #000 calc(100% - ' + Math.ceil(r + 3) + 'px), transparent 100%)';
+      } else {
+        b.style.boxShadow = '0 0 0.5cqw 0.2cqw ' + rgb;
+      }
       if (it.busy) b.style.opacity = '0.94';
       tx.style.color = lum > 135 ? '#111' : '#fff';
     } else if (S.cover) { b.style.background = '#fff'; tx.style.color = '#111'; }
@@ -1282,12 +1344,7 @@ function toggleAuto(on) {
 function setOrig(on) {
   if (!ui.reader) return;
   ui.reader.classList.toggle('orig', on);
-  for (const p of ST.pages) {
-    if (!p.img || !p.el.isConnected) continue;
-    const use = !on && S.clean && S.cover && p.rec && p.rec.clean;
-    if (use) p.img.src = p.rec.clean;
-    else if (p.imgSrc && p.img.src !== p.imgSrc) p.img.src = p.imgSrc;
-  }
+  for (const p of ST.pages) setCleanImg(p);   /* shared logic: swaps blob URL / original, revokes stale URLs */
 }
 
 function applyLook() {
@@ -1400,6 +1457,7 @@ const SCHEMA = [
     { k: 'pad', t: 'range', l: 'Cover padding', min: 0, max: 20, step: 1, u: '%' },
     { k: 'caps', t: 'check', l: 'Uppercase lettering' },
     { k: 'cover', t: 'check', l: 'Erase the original text' },
+    { k: 'blend', t: 'check', l: 'Seamless lettering (hide cover-box edges)' },
   ]],
   ['Reading', [
     { k: 'prefetch', t: 'range', l: 'Translate ahead', min: 1, max: 6, step: 1, u: ' screens' },
