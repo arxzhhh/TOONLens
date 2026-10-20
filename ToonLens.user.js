@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ToonLens
 // @namespace    https://toonlens.local/
-// @version      1.3.1
+// @version      1.3.2
 // @description  Live manhwa / manga / webtoon translator for Safari. Reader mode that detects and translates text as you scroll.
 // @match        http://*/*
 // @match        https://*/*
@@ -61,7 +61,7 @@ class TestError extends Error {
 let testingNow = false;
 /* Which model names the last test attempt actually tried — used in error messages. */
 let lastTriedChain = [];
-const chainNote = () => (S.provider === 'gemini' && lastTriedChain.length > 1 ? lastTriedChain.join(' → ') : modelName());
+const chainNote = () => ((S.provider === 'gemini' || S.provider === 'openrouter') && lastTriedChain.length > 1 ? lastTriedChain.join(' → ') : modelName());
 
 function el(tag, a, ...kids) {
   const e = document.createElement(tag);
@@ -142,8 +142,19 @@ const DEFAULTS = {
 };
 const MODEL_DEFAULT = { gemini: 'gemini-2.5-flash-lite', anthropic: 'claude-sonnet-5-5', openai: '', openrouter: '' };
 /* Free hosted vision models on OpenRouter's no-restrictions route (:free), tried in order when
-   the Model field is empty. These run on other people's GPUs — zero load on your PC, zero $ cost. */
-const OPENROUTER_FREE_MODELS = ['qwen/qwen3-vl-8b-instruct:free', 'google/gemini-2.0-flash-exp:free', 'qwen/qwen2.5-vl-7b-instruct:free'];
+   the Model field is empty. These run on other people's GPUs — zero load on your PC, zero $ cost.
+   NOTE: OpenRouter retires :free ids without notice (e.g. qwen/qwen2.5-vl-7b-instruct:free and
+   google/gemini-2.0-flash-exp:free were removed; they now return "400 ... is not a valid model
+   ID"). Keep this list in sync with https://openrouter.ai/api/v1/models (vision-capable, :free). */
+const OPENROUTER_FREE_MODELS = ['nvidia/nemotron-3.5-super-vl:free', 'google/gemma-4-26b-a4b-it:free', 'google/gemma-4-31b-it:free'];
+/* Retired/invalid OpenRouter model ids users may still have saved in Settings → Model or as the
+   sticky pick. Mapped to a current free vision model so old settings don't error out with
+   "is not a valid model ID". */
+const OR_RETIRED_MODELS = {
+  'qwen/qwen2.5-vl-7b-instruct:free': 'nvidia/nemotron-3.5-super-vl:free',
+  'qwen/qwen3-vl-8b-instruct:free': 'nvidia/nemotron-3.5-super-vl:free',
+  'google/gemini-2.0-flash-exp:free': 'google/gemma-4-26b-a4b-it:free',
+};
 /* Models that Google offers on the free tier of AI Studio keys, in order of preference. */
 const GEMINI_FREE_MODELS = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
 const RETR = new Set(['provider', 'model', 'baseUrl', 'localBase', 'orModel', 'target', 'source', 'style', 'honorifics', 'sfx', 'glossary', 'extra']);
@@ -175,6 +186,10 @@ async function loadSettings() {
     /* 'gemini-2.5-flash' stopped having a free tier for many keys — fall back to the empty
        default so modelName() picks a model that is currently free. */
     if (v.model === 'gemini-2.5-flash') v.model = '';
+    /* Migrate OpenRouter model ids that have since been retired — otherwise every call fails with
+       "400 ... is not a valid model ID" before the fallback chain can even run. */
+    if (v.model && OR_RETIRED_MODELS[v.model]) v.model = OR_RETIRED_MODELS[v.model];
+    if (v.orModel && OR_RETIRED_MODELS[v.orModel]) v.orModel = OR_RETIRED_MODELS[v.orModel];
     /* One free AI Studio key has a small daily quota. Extra keys go in the "Backup API keys"
        field (one per line) and are rotated automatically, which is how near-unlimited free
        usage is achieved. Migrate anything pasted into the old single-key box. */
@@ -646,6 +661,7 @@ async function callOpenRouter({ system, text, image }, apiKey) {
   const chain = [];
   for (const m of [custom, sticky]) if (m && !chain.includes(m)) chain.push(m);
   for (const m of OPENROUTER_FREE_MODELS) if (!chain.includes(m)) chain.push(m);
+  lastTriedChain = chain.slice();
   const keyLabel = apiKey ? 'key #' + (clamp(S.keyIdx || 0, 0, 99) + 1) : '';
   const url = 'https://openrouter.ai/api/v1/chat/completions';
   let lastErr = null;
