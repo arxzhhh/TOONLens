@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ToonLens
 // @namespace    https://toonlens.local/
-// @version      1.0.0
+// @version      1.3.0
 // @description  Live manhwa / manga / webtoon translator for Safari. Reader mode that detects and translates text as you scroll.
 // @match        http://*/*
 // @match        https://*/*
@@ -39,6 +39,10 @@ window.__toonlens = true;
 const G = typeof GM !== 'undefined' ? GM : {};
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const NET = { ms: 90000 };
+/* Per-provider request timeouts. Free hosted tiers and local servers (LM Studio / Ollama / llama.cpp) can take
+   minutes on the first call of a session while the model loads off disk, so they get a much
+   longer budget than cloud APIs. */
+const netMsFor = p => (p === 'local' || p === 'openrouter' ? 300000 : NET.ms);
 const withTimeout = (pr, ms, msg) => new Promise((res, rej) => { const t = setTimeout(() => rej(new Error(msg)), ms); pr.then(v => { clearTimeout(t); res(v); }, e => { clearTimeout(t); rej(e); }); });
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const tagOf = v => Object.prototype.toString.call(v);
@@ -130,16 +134,19 @@ function gmRequest(opts) {
 /* ───────────────────────── settings ───────────────────────── */
 
 const DEFAULTS = {
-  v: 2, provider: 'gemini', apiKey: '', model: '', baseUrl: 'https://api.openai.com/v1', thinking: 'low',
+  v: 2, provider: 'gemini', apiKey: '', model: '', baseUrl: 'https://api.openai.com/v1', localBase: 'http://localhost:1234/v1', orModel: '', thinking: 'low', keys: [], keyIdx: 0, keysText: '',
   target: 'English', source: 'auto', style: 'natural', honorifics: true, sfx: true, glossary: '', extra: '',
   font: 'comic', fontScale: 100, pad: 6, caps: false, cover: true,
   prefetch: 2, concurrency: 1, scrollSpeed: 4, autoStart: false, pill: 'detected',
   imgMax: 1000, quality: 0.85,
 };
-const MODEL_DEFAULT = { gemini: 'gemini-2.5-flash-lite', anthropic: 'claude-sonnet-5-5', openai: '' };
+const MODEL_DEFAULT = { gemini: 'gemini-2.5-flash-lite', anthropic: 'claude-sonnet-5-5', openai: '', openrouter: '' };
+/* Free hosted vision models on OpenRouter's no-restrictions route (:free), tried in order when
+   the Model field is empty. These run on other people's GPUs — zero load on your PC, zero $ cost. */
+const OPENROUTER_FREE_MODELS = ['qwen/qwen3-vl-8b-instruct:free', 'google/gemini-2.0-flash-exp:free', 'qwen/qwen2.5-vl-7b-instruct:free'];
 /* Models that Google offers on the free tier of AI Studio keys, in order of preference. */
 const GEMINI_FREE_MODELS = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
-const RETR = new Set(['provider', 'model', 'baseUrl', 'target', 'source', 'style', 'honorifics', 'sfx', 'glossary', 'extra']);
+const RETR = new Set(['provider', 'model', 'baseUrl', 'localBase', 'orModel', 'target', 'source', 'style', 'honorifics', 'sfx', 'glossary', 'extra']);
 const LOOK = new Set(['font', 'fontScale', 'pad', 'caps', 'cover']);
 const FONTS = {
   comic: { l: 'Comic', f: '"Chalkboard SE","Marker Felt","Comic Neue","Comic Sans MS","Bradley Hand",system-ui,sans-serif', w: 700 },
@@ -163,11 +170,28 @@ async function loadSettings() {
     /* 'gemini-2.5-flash' stopped having a free tier for many keys — fall back to the empty
        default so modelName() picks a model that is currently free. */
     if (v.model === 'gemini-2.5-flash') v.model = '';
+    /* One free AI Studio key has a small daily quota. Extra keys go in the "Backup API keys"
+       field (one per line) and are rotated automatically, which is how near-unlimited free
+       usage is achieved. Migrate anything pasted into the old single-key box. */
     Object.assign(S, v);
+    if (!Array.isArray(S.keys)) S.keys = [];
+    const allKeys = [S.apiKey, ...S.keys].map(k => String(k).trim()).filter(Boolean);
+    const uniq = [...new Set(allKeys)];
+    if (uniq.length !== allKeys.length || (S.apiKey && !S.keys.length)) {
+      S.apiKey = uniq[0] || ''; S.keys = uniq.slice(1);
+    }
+    if (!Number.isInteger(S.keyIdx) || S.keyIdx < 0) S.keyIdx = 0;
   }
+  ui.keysText = [S.apiKey, ...S.keys].filter(Boolean).join('\n');
 }
 const saveSettings = () => gmSet('settings', S);
-const modelName = () => S.model || MODEL_DEFAULT[S.provider] || '';
+const modelName = () => (S.provider === 'local' ? String(S.model || '').trim() : S.provider === 'openrouter' ? (String(S.model || '').trim() || String(S.orModel || '').trim()) : S.model || MODEL_DEFAULT[S.provider] || '');
+
+/* All configured keys, primary first. */
+const allKeys = () => {
+  const raw = [S.apiKey, ...(Array.isArray(S.keys) ? S.keys : [])];
+  return [...new Set(raw.map(k => String(k).trim()).filter(Boolean))];
+};
 
 /* ─────────────────────── translation cache (IndexedDB) ─────────────────────── */
 
@@ -431,16 +455,24 @@ function learn(res) {
    "Test connection" button runs, so a failed test never freezes the whole reader. */
 function netErr(msg, kind, wait) { return testingNow ? new TestError(msg, kind, wait) : new TLError(msg, kind, wait); }
 
-function httpError(r) {
+/* Daily free quota exhausted — Google says "Resource has been exhausted" / "PerDay". */
+const isDailyQuota = text => {
+  const t = String(text || '');
+  return /RESOURCE_EXHAUSTED/i.test(t) || (/quota/i.test(t) && /(exhausted|PerDay|per day|daily|24 ?h)/i.test(t));
+};
+
+function httpError(r, keyLabel) {
   let msg = ''; try { const j = JSON.parse(r.text); msg = (j.error && (j.error.message || j.error)) || j.message || ''; } catch (e) { msg = String(r.text || '').slice(0, 200); }
   msg = String(msg);
-  if (r.status === 401 || r.status === 403) return netErr('API key rejected (' + r.status + '). Double-check the whole key is pasted in Settings — copy it again from aistudio.google.com/apikey. ' + (msg || ''), 'fatal');
+  const who = keyLabel ? ' (' + keyLabel + ')' : '';
+  if (r.status === 401 || r.status === 403) return netErr('API key rejected' + who + ' (' + r.status + '). Double-check the whole key is pasted in Settings — copy it again from aistudio.google.com/apikey. ' + (msg || ''), 'fatal');
   if (r.status === 429) {
     if (/limit:\s*0\b/.test(r.text || '')) return netErr('This model has no free quota on your key. Leave the Model field empty (or use gemini-2.5-flash-lite).', 'fatal');
-    if (/PerDay|per day|daily/i.test(r.text || '')) return netErr('Daily free quota used up. Try again tomorrow or switch the model to gemini-2.5-flash-lite.', 'fatal');
+    if (isDailyQuota(r.text)) return netErr('Daily free quota used up' + who + '. Add another free key in Settings → Backup API keys (one per line), or wait until tomorrow.', 'daily');
     const m = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(r.text || '') || /retry-after:\s*(\d+)/i.exec(r.headers || '');
     return netErr('Rate limited', 'rate', clamp(m ? Math.ceil(parseFloat(m[1]) * 1000) + 500 : 20000, 3000, 120000));
   }
+  if (r.status === 400 && isDailyQuota(r.text)) return netErr('Daily free quota used up' + who + '. Add another free key in Settings → Backup API keys (one per line), or wait until tomorrow.', 'daily');
   if (r.status === 400 && /api key|API_KEY/i.test(msg)) return netErr('API key invalid: ' + msg.slice(0, 120), 'fatal');
   if (r.status === 403 && /permission|disabled|not serve|region/i.test(msg)) return netErr('Google refused this request: ' + msg.slice(0, 160), 'fatal');
   if (r.status === 404) return netErr('Model "' + modelName() + '" not found. Leave the Model field empty for the default, or type an exact name like gemini-2.5-flash-lite.', 'fatal');
@@ -448,27 +480,72 @@ function httpError(r) {
   return netErr('Request failed (' + r.status + '): ' + msg.slice(0, 160), 'retry');
 }
 
-async function apiPost(url, headers, body) {
-  const data = JSON.stringify(body), errs = [];
+async function apiPost(url, headers, body, timeout) {
+  const data = JSON.stringify(body), ms = timeout || NET.ms, errs = [];
   try {
     const ctl = typeof AbortController === 'function' ? new AbortController() : null;
-    const timer = setTimeout(() => ctl && ctl.abort(), NET.ms);
+    const timer = setTimeout(() => ctl && ctl.abort(), ms);
     try {
       const r = await fetch(url, { method: 'POST', headers, body: data, signal: ctl ? ctl.signal : undefined });
       return { status: r.status, text: await r.text(), headers: Array.from(r.headers.entries()).map(e => e[0] + ': ' + e[1]).join('\n') };
     } finally { clearTimeout(timer); }
   } catch (e) { errs.push('direct: ' + ((e && e.message) || e)); }
   try {
-    const r = await gmRequest({ url, method: 'POST', headers, data, responseType: 'text', timeout: NET.ms });
+    const r = await gmRequest({ url, method: 'POST', headers, data, responseType: 'text', timeout: ms });
     return { status: r.status, text: r.responseText != null ? r.responseText : (typeof r.response === 'string' ? r.response : ''), headers: r.responseHeaders || '' };
   } catch (e) { errs.push('userscript: ' + ((e && e.message) || e)); }
   throw netErr('Could not reach the AI service (' + errs.join('; ') + ')', 'retry');
 }
 
-async function callModel({ system, text, image }) {
-  if (!S.apiKey) throw netErr('Add your API key in Settings.', 'fatal');
-  const p = S.provider, model = modelName();
+/* Plain GET via fetch with GM fallback — used to probe local servers (/v1/models, /api/tags). */
+async function apiGet(url, headers, timeout) {
+  const ms = timeout || NET.ms, errs = [];
+  try {
+    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = setTimeout(() => ctl && ctl.abort(), ms);
+    try {
+      const r = await fetch(url, { method: 'GET', headers, signal: ctl ? ctl.signal : undefined });
+      return { status: r.status, text: await r.text() };
+    } finally { clearTimeout(timer); }
+  } catch (e) { errs.push('direct: ' + ((e && e.message) || e)); }
+  try {
+    const r = await gmRequest({ url, method: 'GET', headers, responseType: 'text', timeout: ms });
+    return { status: r.status, text: r.responseText != null ? r.responseText : (typeof r.response === 'string' ? r.response : '') };
+  } catch (e) { errs.push('userscript: ' + ((e && e.message) || e)); }
+  throw netErr('Could not reach the AI service (' + errs.join('; ') + ')', 'retry');
+}
+
+async function callModel(req) {
+  /* Local servers need no key at all — skip the key-rotation machinery entirely. */
+  if (S.provider === 'local') return callModelOnce(req, S.apiKey || 'local');
+  const keys = allKeys();
+  /* OpenRouter works without a key too (free models only, tighter anonymous limits). */
+  if (S.provider === 'openrouter' && !keys.length) return callModelOnce(req, '');
+  if (!keys.length) throw netErr('Add your API key in Settings.', 'fatal');
+  /* Try every configured key in turn (round-robin starting at the last one that worked). When a
+     free key hits its DAILY quota the next key is used automatically — this is how ToonLens keeps
+     translating past a single key's limit, the same trick OpenToon does with multiple accounts. */
+  let idx = clamp(Number.isInteger(S.keyIdx) ? S.keyIdx : 0, 0, keys.length - 1);
+  let lastErr = null;
+  for (let tried = 0; tried < keys.length; tried++) {
+    S.keyIdx = idx % keys.length;
+    try { return await callModelOnce(req, keys[S.keyIdx]); }
+    catch (e) {
+      lastErr = e;
+      if (!(e && e.kind === 'daily')) throw e;
+      idx++;
+    }
+  }
+  throw lastErr || netErr('Every API key has hit its daily quota.', 'daily');
+}
+
+async function callModelOnce({ system, text, image }, apiKey) {
+  const p = S.provider;
+  if (p === 'local') return callLocal({ system, text, image }, apiKey);
+  if (p === 'openrouter') return callOpenRouter({ system, text, image }, apiKey);
+  const model = modelName();
   if (!model) throw netErr('Enter a model name in Settings.', 'fatal');
+  const keyLabel = 'key #' + (clamp(S.keyIdx || 0, 0, 99) + 1);
 
   if (p === 'gemini') {
     const gen = { temperature: 0.3, maxOutputTokens: 8192, responseMimeType: 'application/json' };
@@ -478,7 +555,7 @@ async function callModel({ system, text, image }) {
       systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts }], generationConfig: gen,
       safetySettings: ['HARASSMENT', 'HATE_SPEECH', 'SEXUALLY_EXPLICIT', 'DANGEROUS_CONTENT'].map(c => ({ category: 'HARM_CATEGORY_' + c, threshold: 'BLOCK_NONE' })),
     };
-    const headers = { 'content-type': 'application/json', 'x-goog-api-key': S.apiKey };
+    const headers = { 'content-type': 'application/json', 'x-goog-api-key': apiKey };
     /* Free-tier models change often; if the configured one is missing/has no quota, quietly try
        the other known free ones before giving up. */
     const chain = [model];
@@ -495,7 +572,7 @@ async function callModel({ system, text, image }) {
         ok = r; break;
       }
       const switchable = r.status === 404 || (r.status === 429 && /limit:\s*0\b/.test(r.text || ''));
-      if (!(switchable && i < chain.length - 1)) throw httpError(r);
+      if (!(switchable && i < chain.length - 1)) throw httpError(r, keyLabel);
     }
     let j; try { j = JSON.parse(ok.text); } catch (e) { throw netErr('Bad response from Gemini', 'retry'); }
     if (j.promptFeedback && j.promptFeedback.blockReason) throw netErr('Blocked by Gemini (' + j.promptFeedback.blockReason + ')', 'final');
@@ -508,10 +585,10 @@ async function callModel({ system, text, image }) {
   if (p === 'anthropic') {
     const content = []; if (image) content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } }); content.push({ type: 'text', text });
     const body = { model, max_tokens: 8192, temperature: 0.3, system, messages: [{ role: 'user', content }] };
-    const headers = { 'content-type': 'application/json', 'x-api-key': S.apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' };
+    const headers = { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' };
     let r = await apiPost('https://api.anthropic.com/v1/messages', headers, body);
     if (r.status === 400 && /temperature/i.test(r.text)) { delete body.temperature; r = await apiPost('https://api.anthropic.com/v1/messages', headers, body); }
-    if (r.status !== 200) throw httpError(r);
+    if (r.status !== 200) throw httpError(r, keyLabel);
     let j; try { j = JSON.parse(r.text); } catch (e) { throw netErr('Bad response from Claude', 'retry'); }
     const out = (j.content || []).filter(x => x.type === 'text').map(x => x.text).join('');
     if (!out) throw netErr('Claude returned no text', 'retry');
@@ -521,7 +598,7 @@ async function callModel({ system, text, image }) {
   const base = String(S.baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '');
   const content = [{ type: 'text', text }]; if (image) content.push({ type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + image } });
   const body = { model, temperature: 0.3, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: system }, { role: 'user', content }] };
-  const headers = { 'content-type': 'application/json', authorization: 'Bearer ' + S.apiKey };
+  const headers = { 'content-type': 'application/json', authorization: 'Bearer ' + apiKey };
   let r;
   for (let i = 0; i < 3; i++) {
     r = await apiPost(base + '/chat/completions', headers, body);
@@ -530,10 +607,155 @@ async function callModel({ system, text, image }) {
     for (const k of ['temperature', 'response_format']) if (body[k] !== undefined && new RegExp(k, 'i').test(r.text)) { delete body[k]; stripped = true; }
     if (!stripped) break;
   }
-  if (r.status !== 200) throw httpError(r);
+  if (r.status !== 200) throw httpError(r, keyLabel);
   let j; try { j = JSON.parse(r.text); } catch (e) { throw netErr('Bad response from provider', 'retry'); }
   const out = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
   if (!out) throw netErr('Provider returned no text', 'retry');
+  return out;
+}
+
+/* ─────────────── free hosted vision models (OpenRouter) ─────────────── */
+
+/* For PCs too weak for local models: OpenRouter runs small vision models on THEIR servers and
+   offers several ":free" routes — no credit card, nothing installed. Free routes have modest
+   limits (~50 requests/day per key, 20 req/min), so ToonLens rotates through your backup keys
+   exactly like it does for Gemini, and falls back between free models when one is unavailable.
+   A key is optional (anonymous calls work with tighter limits). The allow-list below pins the
+   route to free/no-restrictions providers only, so a :free model can never silently spill onto
+   a paid provider and burn credits. */
+
+async function orOnce(url, headers, body, ms) {
+  const r = await apiPost(url, headers, body, ms);
+  let j = null; try { j = JSON.parse(r.text); } catch (e) { /* handled below */ }
+  return { r, j };
+}
+
+async function callOpenRouter({ system, text, image }, apiKey) {
+  const ms = netMsFor('openrouter');
+  const headers = { 'content-type': 'application/json', 'HTTP-Referer': 'https://toonlens.local/', 'X-Title': 'ToonLens' };
+  if (apiKey) headers.authorization = 'Bearer ' + apiKey;
+  const content = [{ type: 'text', text }]; if (image) content.push({ type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + image } });
+  /* Sticky model: once a free model has worked we keep using it instead of re-probing the chain. */
+  const sticky = String(S.orModel || '').trim();
+  const custom = String(S.model || '').trim();
+  const chain = [];
+  for (const m of [custom, sticky]) if (m && !chain.includes(m)) chain.push(m);
+  for (const m of OPENROUTER_FREE_MODELS) if (!chain.includes(m)) chain.push(m);
+  const keyLabel = apiKey ? 'key #' + (clamp(S.keyIdx || 0, 0, 99) + 1) : '';
+  const url = 'https://openrouter.ai/api/v1/chat/completions';
+  let lastErr = null;
+  for (let i = 0; i < chain.length; i++) {
+    const model = chain[i];
+    const body = {
+      model, messages: [{ role: 'system', content: system }, { role: 'user', content }],
+      temperature: 0.3, max_tokens: 8192, response_format: { type: 'json_object' },
+    };
+    /* Free routes must never spill onto paid providers — pin the route to no-restriction
+       endpoints and disable fallbacks so a $0 model can't silently bill a $10 one. */
+    body.provider = { allow_fallbacks: false };
+    if (/:free$/.test(model)) body.provider.order = ['*'];
+    let r, j;
+    try { ({ r, j } = await orOnce(url, headers, body, ms)); }
+    catch (e) { lastErr = e; break; } /* network failure — retryable, bubble up */
+    if (r.status === 200 && j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) {
+      if (model !== sticky) { S.orModel = model; saveSettings(); if (!custom && sticky) toast('Using ' + model + ' on OpenRouter.', true); }
+      return j.choices[0].message.content;
+    }
+    const msg = (j && j.error && (j.error.message || j.error.code)) || String(r.text || '').slice(0, 200);
+    if (r.status === 429) {
+      if (/day/i.test(String(msg))) { lastErr = netErr('Daily free limit reached on OpenRouter' + (keyLabel ? ' (' + keyLabel + ')' : '') + '. Add another free OpenRouter key in Settings → Backup API keys (one per line), or wait until tomorrow.', 'daily'); continue; }
+      lastErr = netErr('Rate limited by OpenRouter: ' + String(msg).slice(0, 140), 'rate', 60000); continue;
+    }
+    if (r.status === 401 || r.status === 403) { lastErr = netErr('OpenRouter rejected the key' + (keyLabel ? ' ' + keyLabel : '') + '. Copy a fresh key from openrouter.ai/keys, or leave the key field empty to use it anonymously.', 'fatal'); continue; }
+    /* Model missing / no free providers / bad request → quietly try the next free model. */
+    lastErr = netErr('OpenRouter error (' + r.status + '): ' + String(msg).slice(0, 160), i < chain.length - 1 ? 'retry' : 'final');
+  }
+  throw lastErr || netErr('No free OpenRouter model responded. Try again shortly or pick another :free model in Settings → Model.', 'retry');
+}
+
+/* ─────────────────── local vision models (LM Studio / Ollama / llama.cpp) ─────────────────── */
+
+/* Local servers have NO quotas at all — this is the fully unlimited option. The OpenAI-style
+   chat endpoint below works with LM Studio (Server tab → enable "Local Server" + CORS, default
+   port 1234), llama.cpp's server (-ngl 99 --port 8080), Jan, KoboldCpp's OpenAI layer and any
+   other OpenAI-compatible local runtime. Ollama is auto-detected from its base URL and uses its
+   native /api/chat endpoint (set a model's num_ctx to >= 8192 for best results). */
+
+const LOCAL_DEFAULT_BASE = 'http://localhost:1234/v1';
+let localModelCache = { base: '', ids: [], at: 0 };
+
+const isOllamaUrl = u => { try { const x = new URL(u); return x.hostname === 'localhost' && x.port === '11434'; } catch (e) { return false; } };
+const ollamaOrigin = u => { try { const x = new URL(u); return x.protocol + '//' + x.host; } catch (e) { return ''; } };
+
+async function listLocalModels() {
+  const base = String(S.localBase || LOCAL_DEFAULT_BASE).replace(/\/+$/, '');
+  if (localModelCache.base === base && Date.now() - localModelCache.at < 60000) return localModelCache.ids;
+  const headers = { 'content-type': 'application/json', ...(S.apiKey ? { authorization: 'Bearer ' + S.apiKey } : {}) };
+  const urls = isOllamaUrl(base) ? [ollamaOrigin(base) + '/api/tags', base + '/models'] : [base + '/models'];
+  let lastErr = null;
+  for (const url of urls) {
+    try {
+      const r = await apiGet(url, headers, 15000);
+      if (r.status !== 200) { lastErr = 'HTTP ' + r.status; continue; }
+      let j; try { j = JSON.parse(r.text); } catch (e) { lastErr = 'not JSON'; continue; }
+      const arr = Array.isArray(j) ? j : (j.data || j.models || []);
+      const ids = arr.map(m => (typeof m === 'string' ? m : (m.id || m.model || m.name))).filter(Boolean);
+      if (ids.length) { localModelCache = { base, ids, at: Date.now() }; return ids; }
+      lastErr = 'empty list';
+    } catch (e) { lastErr = (e && e.message) || String(e); }
+  }
+  throw netErr('Could not read the model list from ' + base + ' (' + lastErr + '). Make sure the local server is running and CORS is enabled.', 'retry');
+}
+
+const VISION_HINT = /(vision|vl|moondrop)/i;
+const pickVisionModel = ids => {
+  const vis = ids.filter(id => VISION_HINT.test(id));
+  const pool = vis.length ? vis : ids;
+  const qw = pool.filter(id => /qwen.*[23]/i.test(id));
+  if (qw.length) return qw[qw.length - 1];
+  return pool[0];
+};
+
+function localError(r) {
+  const low = String(r.text || '').toLowerCase();
+  if (r.status === 404 && /model/.test(low)) return netErr('The local server does not have that model loaded. Load it in LM Studio/Ollama first, or press "Use a loaded model" in Settings.', 'fatal');
+  if (r.status === 400 && /does not support images|image.*not support|unsupported.*image/i.test(r.text || '')) return netErr('That model cannot see images. Pick a vision model like Qwen2.5-VL 7B or Moondream.', 'fatal');
+  if (r.status >= 500) return netErr('Local server error ' + r.status + ': ' + String(r.text || '').slice(0, 160), 'retry');
+  return netErr('Local request failed (' + r.status + '): ' + String(r.text || '').slice(0, 160), 'retry');
+}
+
+async function callLocal({ system, text, image }, apiKey) {
+  const ms = netMsFor('local');
+  const base = String(S.localBase || LOCAL_DEFAULT_BASE).replace(/\/+$/, '') || LOCAL_DEFAULT_BASE.replace(/\/+$/, '');
+  const headers = { 'content-type': 'application/json', ...(apiKey && apiKey !== 'local' ? { authorization: 'Bearer ' + apiKey } : {}) };
+  let model = modelName(), out = '';
+  if (!model) { try { model = pickVisionModel(await listLocalModels()); } catch (e) { /* fall through to a clearer error below */ } }
+
+  if (isOllamaUrl(base)) {
+    /* Ollama's native API: no "/v1" suffix, images as plain base64, JSON mode via "format". */
+    const content = []; if (image) content.push({ type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + image } }); content.push({ type: 'text', text });
+    const body = { model, stream: false, format: 'json', options: { temperature: 0.3 }, messages: [{ role: 'system', content: system }, { role: 'user', content }] };
+    const r = await apiPost(ollamaOrigin(base) + '/api/chat', headers, body, ms);
+    if (r.status !== 200) { if (r.status === 404 && !model) throw netErr('Enter the exact Ollama model name in Settings → Model (see "ollama list"), e.g. llava:13b.', 'fatal'); throw localError(r); }
+    let j; try { j = JSON.parse(r.text); } catch (e) { throw netErr('Bad response from Ollama', 'retry'); }
+    out = (j.message && j.message.content) || '';
+  } else {
+    if (!model) throw netErr('Enter the exact model name your local server exposes in Settings → Model (or press "Use a loaded model").', 'fatal');
+    const content = [{ type: 'text', text }]; if (image) content.push({ type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + image } });
+    const body = { model, temperature: 0.3, max_tokens: 8192, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: system }, { role: 'user', content }] };
+    let r;
+    for (let i = 0; i < 3; i++) {
+      r = await apiPost(base + '/chat/completions', headers, body, ms);
+      if (r.status !== 400) break;
+      let stripped = false;
+      for (const k of ['temperature', 'response_format', 'max_tokens']) if (body[k] !== undefined && new RegExp(k.replace('_', '[_ ]?'), 'i').test(r.text)) { delete body[k]; stripped = true; }
+      if (!stripped) break;
+    }
+    if (r.status !== 200) { if (r.status === 404 && !S.model) throw netErr('Model "' + modelName() + '" not found on the local server. Press "Use a loaded model" in Settings.', 'fatal'); throw localError(r); }
+    let j; try { j = JSON.parse(r.text); } catch (e) { throw netErr('Bad response from the local server', 'retry'); }
+    out = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+  }
+  if (!out) throw netErr('The local model returned no text. If it is still loading the first run, try again.', 'retry');
   return out;
 }
 
@@ -542,7 +764,7 @@ async function callModel({ system, text, image }) {
 async function translatePage(p) {
   const key = cacheKey(p), hit = await idb.get(key);
   if (hit && hit.v === 1) { p.rec = hit; p.key = key; renderPage(p); return; }
-  if (!S.apiKey) throw new TLError('Add your API key in Settings.', 'fatal');
+  if (S.provider !== 'local' && S.provider !== 'openrouter' && !allKeys().length) throw new TLError('Add your API key in Settings.', 'fatal');
   const blob = p.blob || await fetchImageBlob(p.url, p.ref);
   const bmp = await decode(blob);
   try {
@@ -593,6 +815,13 @@ async function run(p) {
       p.status = 'error'; p.err = e.message;
       toast(e.message, true);
       if (/key|model/i.test(e.message)) openSettings();
+    }
+    else if (kind === 'daily') {
+      /* Every configured key is out of daily quota. Park this page with a clear message; other
+         pages stay actionable and everything resumes automatically when a quota resets. */
+      p.status = 'error'; p.err = e.message;
+      toast(e.message, true);
+      openSettings();
     }
     else if (kind === 'rate') {
       ST.backoff = Date.now() + (e.wait || 15000); p.status = 'idle';
@@ -845,7 +1074,7 @@ async function startReader(o) {
     const hst = (await gmGet('history', [])).filter(x => x.url !== location.href);
     hst.unshift({ url: location.href, title: o.title, ts: Date.now() }); gmSet('history', hst.slice(0, 25));
   }
-  if (!S.apiKey) { toast('Add your API key to start translating.', true); openSettings(); }
+  if (!allKeys().length) { toast('Add your API key to start translating.', true); openSettings(); }
   schedule();
 }
 
@@ -926,7 +1155,7 @@ async function showHome() {
   ui.home = el('div', { class: 'home' },
     el('div', { class: 'top' }, el('div', { class: 'brand', text: 'ToonLens' }), el('button', { class: 'btn', text: 'Close', onclick: hideHome })),
     el('p', { class: 'lede', text: 'Paste a chapter link. It opens like a normal page, then translates as you scroll.' }),
-    S.apiKey ? null : el('div', { class: 'note', text: 'No API key yet. On a computer, open aistudio.google.com/apikey, sign in with any Google account and press "Create API key" (it is free, no credit card). Copy the key that starts with AIza, then paste it into ToonLens Settings → API key.' }),
+    allKeys().length ? null : el('div', { class: 'note', text: 'No API key yet. On a computer, open aistudio.google.com/apikey, sign in with any Google account and press "Create API key" (it is free, no credit card). Copy the key that starts with AIza, then paste it into ToonLens Settings → API key.' }),
     el('div', { class: 'url' }, input, el('button', { class: 'btn pri', text: 'Open', onclick: go })),
     el('div', { class: 'row gap' }, el('button', { class: 'btn', text: 'Translate images from Photos', onclick: () => file.click() }), el('button', { class: 'btn', text: 'Settings', onclick: openSettings })),
     file, recent);
@@ -965,10 +1194,14 @@ async function waitAndStart() {
 
 const SCHEMA = [
   ['AI engine', [
-    { k: 'provider', t: 'select', l: 'Provider', o: [['gemini', 'Google Gemini (recommended)'], ['anthropic', 'Anthropic Claude'], ['openai', 'OpenAI-compatible']] },
-    { k: 'apiKey', t: 'password', l: 'API key', h: 'Free Google key: open aistudio.google.com/apikey on a computer, sign in with any Google account, press "Create API key", copy it (starts with AIza) and paste it here. No credit card needed. Stays on this device.' },
-    { k: 'model', t: 'text', l: 'Model', h: 'Leave empty for the default (gemini-2.5-flash-lite, free tier). If you get quota errors, type gemini-2.0-flash.' },
+    { k: 'provider', t: 'select', l: 'Provider', o: [['gemini', 'Google Gemini (recommended)'], ['openrouter', 'OpenRouter free hosted models (no PC power needed)'], ['local', 'Local model — LM Studio / Ollama (no limits)'], ['anthropic', 'Anthropic Claude'], ['openai', 'OpenAI-compatible']] },
+    { k: 'apiKey', t: 'password', l: 'API key', h: 'Free Google key: open aistudio.google.com/apikey on a computer, sign in with any Google account, press "Create API key", copy it (starts with AIza) and paste it here. No credit card needed. Stays on this device. Not needed for Local models; optional for OpenRouter (free models also work without a key, but a key from openrouter.ai/keys gives higher limits).', show: s => s.provider !== 'local' },
+    { k: 'keysText', t: 'area', l: 'Backup API keys', ph: 'AIza... / sk-or-... (one per line)', h: 'Each free key has a small daily quota. Paste more free keys here, one per line (each comes from a different free Google account at aistudio.google.com/apikey, or a different free OpenRouter account at openrouter.ai/keys). ToonLens automatically switches to the next key when one runs out of quota, so you can keep reading past the limit.', show: s => s.provider === 'gemini' || s.provider === 'openrouter' || s.provider === 'openai' },
+    { k: 'model', t: 'text', l: 'Model', h: s => s.provider === 'openrouter' ? 'Leave empty to auto-pick a free hosted vision model (Qwen3-VL :free routes). You can type any OpenRouter model id, e.g. qwen/qwen3-vl-8b-instruct:free.' : s.provider === 'local' ? 'Leave empty or press the loaded-models button below.' : 'Leave empty for the default (gemini-2.5-flash-lite, free tier). If you get quota errors, type gemini-2.0-flash.' },
     { k: 'baseUrl', t: 'text', l: 'API base URL', show: s => s.provider === 'openai' },
+    { k: 'localBase', t: 'text', l: 'Local server URL', show: s => s.provider === 'local' },
+    /* localPick is not a real setting — openSettings() renders pickBtn in its place. */
+    { k: 'localPick', t: 'button', l: 'Loaded models', show: () => false },
     { k: 'thinking', t: 'select', l: 'Gemini thinking', show: s => s.provider === 'gemini', o: [['minimal', 'Minimal (fastest)'], ['low', 'Low (balanced)'], ['medium', 'Medium'], ['high', 'High (slowest)'], ['off', 'Do not send']] },
   ]],
   ['Translation', [
@@ -999,15 +1232,23 @@ const SCHEMA = [
 function openSettings() {
   if (ui.sheet) return;
   const vis = [], persist = () => { clearTimeout(ST.pt); ST.pt = setTimeout(saveSettings, 300); };
-  const refresh = () => vis.forEach(v => v.w.classList.toggle('hide', !v.show(S)));
+  let refresh = () => vis.forEach(v => v.w.classList.toggle('hide', !v.show(S)));
   const body = el('div');
   const ctl = {};
   for (const [title, fields] of SCHEMA) {
     body.append(el('div', { class: 'grp', text: title }));
     for (const f of fields) {
       const upd = v => {
+        if (f.k === 'keysText') {
+          /* Primary box keeps the first key so it stays masked; the rest go to S.keys. */
+          const list = String(v).split(/[\n;,]+/).map(x => x.trim()).filter(Boolean);
+          const uniq = [...new Set(list)];
+          S.apiKey = uniq[0] || ''; S.keys = uniq.slice(1); S.keyIdx = 0;
+          persist(); refresh(); return;
+        }
         S[f.k] = v; if (RETR.has(f.k)) ST.dirtyTr = true; if (LOOK.has(f.k)) ST.dirtyLook = true;
-        if (f.k === 'provider') { ctl.model.placeholder = MODEL_DEFAULT[v] || 'model name'; if (Object.values(MODEL_DEFAULT).includes(S.model)) { S.model = ''; ctl.model.value = ''; } }
+        if (f.k === 'provider') { ctl.model.placeholder = MODEL_DEFAULT[v] || (v === 'local' ? 'empty = auto-pick a loaded vision model' : 'model name'); if (Object.values(MODEL_DEFAULT).includes(S.model)) { S.model = ''; ctl.model.value = ''; } }
+        if (f.k === 'apiKey') { S.keyIdx = 0; if (ctl.keysText) ctl.keysText.value = [v, ...S.keys].filter(Boolean).join('\n'); }
         persist(); refresh();
       };
       let w;
@@ -1017,7 +1258,7 @@ function openSettings() {
         const cap = el('span', { text: f.l });
         let c;
         if (f.t === 'select') { c = el('select', { onchange: e => upd(e.target.value) }, ...f.o.map(o => el('option', { value: o[0], text: o[1] }))); c.value = S[f.k]; }
-        else if (f.t === 'area') c = el('textarea', { placeholder: f.ph || '', oninput: e => upd(e.target.value), value: S[f.k] });
+        else if (f.t === 'area') c = el('textarea', { placeholder: f.ph || '', oninput: e => upd(e.target.value), value: f.k === 'keysText' ? ui.keysText : S[f.k] });
         else if (f.t === 'range') {
           const lab = () => cap.textContent = f.l + ': ' + S[f.k] + (f.u || '');
           c = el('input', { type: 'range', min: f.min, max: f.max, step: f.step, value: S[f.k], oninput: e => { upd(+e.target.value); lab(); } }); lab();
@@ -1026,23 +1267,51 @@ function openSettings() {
           if (f.list) c.setAttribute('list', 'tl-langs');
         }
         ctl[f.k] = c;
-        w = el('label', { class: 'f' }, cap, c, f.h ? el('small', { text: f.h }) : null);
+        const hintTxt = () => (typeof f.h === 'function' ? f.h(S) : f.h);
+        w = el('label', { class: 'f' }, cap, c, f.h ? el('small', { text: hintTxt() }) : null);
+        if (typeof f.h === 'function') (f.h._set = s => { const n = w.querySelector('small'); if (n) n.textContent = hintTxt(); })._set(S);
       }
       if (f.show) vis.push({ w, show: f.show });
       body.append(w);
     }
   }
+  /* Function-valued hints depend on the provider — re-render them whenever settings change. */
+  const refreshBase = refresh;
+  refresh = () => { refreshBase(); for (const [title, fields] of SCHEMA) for (const f of fields) if (f.h && typeof f.h === 'function' && f.h._set) f.h._set(S); };
   const out = el('div', { class: 'note hide' });
+  /* "Loaded models": fetch the model list straight from the local server and fill in the Model
+     field. Vision-capable names are marked with an eye; non-vision models cannot read pages. */
+  const pickBtn = el('button', { class: 'btn', text: 'Use a loaded model', onclick: async () => {
+    if (pickBtn.disabled) return;
+    pickBtn.disabled = true; pickBtn.textContent = 'Loading…';
+    out.classList.remove('hide'); out.textContent = 'Reading the model list from ' + (S.localBase || LOCAL_DEFAULT_BASE) + '…';
+    try {
+      localModelCache = { base: '', ids: [], at: 0 };
+      const ids = await listLocalModels();
+      out.textContent = '';
+      out.append(el('div', { text: 'Loaded models on this computer (only 👁 vision models can read pages). Tap one to use it:' }));
+      const wrap = el('div', { class: 'row gap' });
+      for (const id of ids.slice(0, 12)) {
+        wrap.append(el('button', { class: 'btn', style: VISION_HINT.test(id) ? '' : 'opacity:.55', text: (VISION_HINT.test(id) ? '👁 ' : '· ') + id, onclick: () => { S.model = id; ctl.model.value = id; persist(); toast('Using ' + id); } }));
+      }
+      out.append(wrap);
+    } catch (e) {
+      out.textContent = ((e && e.message) || 'Could not reach the local server.') + ' Start LM Studio (Server tab → Local Server, CORS on) or Ollama ("ollama serve"), then try again.';
+    } finally { pickBtn.disabled = false; pickBtn.textContent = 'Use a loaded model'; }
+  } });
   const test = el('button', { class: 'btn', text: 'Test connection', onclick: async () => {
     if (testingNow) return;
     testingNow = true; test.disabled = true; test.textContent = 'Testing...';
-    out.classList.remove('hide'); out.textContent = 'Contacting Google… this can take up to 90 s.'; const t0 = Date.now();
+    const isLocal = S.provider === 'local';
+    out.classList.remove('hide'); out.textContent = isLocal ? 'Contacting your local model… the first request can take a few minutes while the model loads into memory.' : S.provider === 'openrouter' ? 'Contacting OpenRouter… free models can be queued, this can take up to 5 min.' : 'Contacting Google… this can take up to 90 s.'; const t0 = Date.now();
     try {
-      await withTimeout(callModel({ system: 'You are a connectivity test.', text: 'Reply with the single word OK.' }), NET.ms + 5000, 'No response from the AI service after 95 seconds. Check your internet connection and try again.');
-      out.textContent = 'Connected in ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s using ' + modelName() + '. The key works — open a chapter page and it will translate.';
+      await withTimeout(callModel({ system: 'You are a connectivity test.', text: 'Reply with the single word OK.' }), netMsFor(S.provider) + 5000, 'No response from the AI service. Check that it is reachable and try again.');
+      out.textContent = 'Connected in ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s using ' + (modelName() || 'the auto-picked local model') + '. It works — open a chapter page and it will translate.';
     } catch (e) {
-      out.textContent = e.kind === 'rate'
-        ? 'Google says you are over the free limit right now. Wait a minute and test again, or switch the model to gemini-2.5-flash-lite.'
+      out.textContent = e.kind === 'daily'
+        ? 'All configured keys have used up their free quota for today. Add more free keys in "Backup API keys" above (one per line), or wait until the quota resets (midnight Pacific time).'
+        : e.kind === 'rate'
+        ? (S.provider === 'openrouter' ? 'OpenRouter says you are over the free limit right now. Wait a minute and test again, or add another free key above.' : 'Google says you are over the free limit right now. Wait a minute and test again, or switch the model to gemini-2.5-flash-lite.')
         : ((e && e.message) || 'Failed') + ' [tried: ' + chainNote() + ']';
     } finally { testingNow = false; test.disabled = false; test.textContent = 'Test connection'; }
   } });
@@ -1050,7 +1319,7 @@ function openSettings() {
   const done = el('button', { class: 'btn pri', text: 'Done', onclick: closeSettings });
   const dl = el('datalist', { id: 'tl-langs' }, ...LANGS.map(l => el('option', { value: l })));
   ui.sheet = el('div', { class: 'sheet', onclick: e => { if (e.target === ui.sheet) closeSettings(); } },
-    el('div', { class: 'card' }, el('h2', { text: 'ToonLens settings' }), body, out, el('div', { class: 'row gap' }, test, clear), el('div', { class: 'row gap end2' }, done), dl));
+    el('div', { class: 'card' }, el('h2', { text: 'ToonLens settings' }), body, out, el('div', { class: 'row gap' }, test, S.provider === 'local' ? pickBtn : null, clear), el('div', { class: 'row gap end2' }, done), dl));
   ui.root.appendChild(ui.sheet); refresh();
 }
 
@@ -1060,8 +1329,12 @@ function closeSettings() {
   applyLook(); syncPill();
   if (ST.view === 'reader') {
     rebuildIO();
-    if (ST.dirtyTr) { for (const p of ST.pages) { p.rec = null; p.ov.textContent = ''; p.status = 'idle'; p.tries = 0; p.rl = 0; chip(p); } }
-    else if (ST.dirtyLook) ST.pages.forEach(p => p.rec && renderPage(p));
+    if (ST.dirtyTr) {
+      /* Only wipe the on-screen state when something was actually *changed* in this session:
+         closeSettings() also runs right after a page reload, where settings were merely loaded
+         and the cached translations must be kept. */
+      if (ST.pages.length) for (const p of ST.pages) { p.rec = null; p.ov.textContent = ''; p.status = 'idle'; p.tries = 0; p.rl = 0; chip(p); }
+    } else if (ST.dirtyLook) ST.pages.forEach(p => p.rec && renderPage(p));
     schedule();
   } else if (ST.view === 'home') showHome();
   ST.dirtyTr = ST.dirtyLook = false;
